@@ -120,6 +120,7 @@ DOCKER_IMAGE = "nvidia/cuda:12.9.2-cudnn-devel-ubuntu22.04"
 # GPU preference: cheapest 24 GB+ first. All support CUDA 12.8 (driver >= 570.xx).
 GPU_PREFERENCE = [
     "NVIDIA GeForce RTX 4090",        # 24 GB ~$0.34/hr — best value for d12
+    "NVIDIA RTX PRO 4500 Blackwell",  # 32 GB ~$0.34/hr — EU-RO-1 available
     "NVIDIA RTX A6000",               # 48 GB ~$0.33/hr
     "NVIDIA RTX 5000 Ada Generation", # 32 GB ~$0.49/hr
     "NVIDIA L40S",                    # 48 GB ~$0.79/hr
@@ -128,6 +129,7 @@ GPU_PREFERENCE = [
     "NVIDIA RTX 6000 Ada Generation", # 48 GB ~$0.79/hr
     "NVIDIA GeForce RTX 3090",        # 24 GB ~$0.24/hr
     "NVIDIA GeForce RTX 3090 Ti",     # 24 GB ~$0.29/hr
+    "NVIDIA L4",                      # 24 GB ~$0.44/hr — EU-RO-1 available
 ]
 
 VOLUME_MOUNT = "/runpod-volume"
@@ -273,7 +275,7 @@ def find_and_launch_pod(
                 print(f"  {gpu}: ERROR — {e}")
         except Exception as e:
             msg = str(e)
-            if "no longer any instances" in msg or "does not have the resources" in msg:
+            if "no longer any instances" in msg or "does not have the resources" in msg or "There are no longer" in msg:
                 print(f"  {gpu}: unavailable")
             else:
                 print(f"  {gpu}: ERROR — {e}")
@@ -396,14 +398,14 @@ def _make_train_startup(
             "uv pip install rational-kat-cu --quiet",
             # Fail loudly if the CUDA extension didn't load — better to abort now
             # than discover it mid-training when throughput is 123× too slow.
-            # Note: no single quotes inside the python -c string because the entire
-            # startup command is wrapped in bash -c '...'; single quotes would
-            # terminate the outer shell string.  Use sys.exit(1) instead of assert.
+            # Note: no double quotes allowed inside docker_args — the RunPod SDK
+            # does not escape them in the GraphQL mutation string, causing a syntax
+            # error.  Use printf+file to avoid any embedded quotes entirely.
             (
-                ".venv/bin/python -c \""
-                "from nanochat.gpt import _RAT_CUDA_AVAILABLE; import sys; "
-                "sys.exit(0 if _RAT_CUDA_AVAILABLE else 1)\""
-                " || { echo FATAL: rational_kat_cu CUDA kernel not loaded -- check nvcc and CUDA 12.8; exit 1; }"
+                "printf 'from nanochat.gpt import _RAT_CUDA_AVAILABLE\\nimport sys\\n"
+                "sys.exit(0 if _RAT_CUDA_AVAILABLE else 1)\\n' > /tmp/_rat_check.py"
+                " && .venv/bin/python /tmp/_rat_check.py"
+                " || { echo FATAL: rational_kat_cu CUDA kernel not loaded; exit 1; }"
             ),
         ]
 
@@ -491,16 +493,26 @@ def cmd_terminate(args):
 def cmd_volume(args):
     get_api_key()
 
+    from runpod.api.graphql import run_graphql_query
+
     if args.volume_action == "create":
         size = args.size
         # EU-RO-1 has reliable RTX 4090 community availability.
         # Pod and volume MUST be in the same datacenter — see DATACENTER_ID note.
         DATACENTER_ID = "EU-RO-1"
-        vol = runpod.create_network_volume(
-            name="nanochat-checkpoints",
-            size=size,
-            data_center_id=DATACENTER_ID,
-        )
+        mutation = f"""
+        mutation {{
+          createNetworkVolume(input: {{
+            name: "nanochat-checkpoints",
+            size: {size},
+            dataCenterId: "{DATACENTER_ID}"
+          }}) {{
+            id name size dataCenterId
+          }}
+        }}
+        """
+        result = run_graphql_query(mutation)
+        vol = result["data"]["createNetworkVolume"]
         vol_id = vol["id"]
         monthly_cost = size * 0.07
         print(f"Created volume: {vol_id}")
@@ -515,7 +527,9 @@ def cmd_volume(args):
         print("      skipping the ~5 min setup step automatically.")
 
     elif args.volume_action == "ls":
-        vols = runpod.get_network_volumes()
+        query = "{ myself { networkVolumes { id name size dataCenterId } } }"
+        result = run_graphql_query(query)
+        vols = result.get("data", {}).get("myself", {}).get("networkVolumes", [])
         if not vols:
             print("No network volumes.")
             return
@@ -525,7 +539,14 @@ def cmd_volume(args):
             print(f"{v['id']:<25} {v.get('name','?'):<28} {str(v.get('size','?'))+'GB':>6}  {v.get('dataCenterId','?')}")
 
     elif args.volume_action == "delete":
-        runpod.delete_network_volume(args.volume_id)
+        mutation = f"""
+        mutation {{
+          deleteNetworkVolume(input: {{ id: "{args.volume_id}" }}) {{
+            id
+          }}
+        }}
+        """
+        run_graphql_query(mutation)
         print(f"Volume {args.volume_id} deleted.")
 
 
