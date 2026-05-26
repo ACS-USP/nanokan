@@ -115,7 +115,7 @@ BRANCH = "master"
 # CUDA 12.8 devel image: required for nvcc to compile rational_kat_cu.
 # Do NOT use -runtime — it lacks nvcc and rational_kat_cu will silently fall
 # back to the pure-PyTorch Horner loop, which is ~123× slower on backward.
-DOCKER_IMAGE = "nvidia/cuda:12.8.1-cudnn9-devel-ubuntu22.04"
+DOCKER_IMAGE = "nvidia/cuda:12.8.0-cudnn9-devel-ubuntu22.04"
 
 # GPU preference: cheapest 24 GB+ first. All support CUDA 12.8 (driver >= 570.xx).
 GPU_PREFERENCE = [
