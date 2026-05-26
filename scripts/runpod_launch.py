@@ -115,7 +115,7 @@ BRANCH = "master"
 # CUDA 12.8 devel image: required for nvcc to compile rational_kat_cu.
 # Do NOT use -runtime — it lacks nvcc and rational_kat_cu will silently fall
 # back to the pure-PyTorch Horner loop, which is ~123× slower on backward.
-DOCKER_IMAGE = "nvidia/cuda:12.8.0-cudnn9-devel-ubuntu22.04"
+DOCKER_IMAGE = "nvidia/cuda:12.9.2-cudnn-devel-ubuntu22.04"
 
 # GPU preference: cheapest 24 GB+ first. All support CUDA 12.8 (driver >= 570.xx).
 GPU_PREFERENCE = [
@@ -201,12 +201,14 @@ def _try_launch_pod(
     import time
 
     tok = get_github_token()
-    wandb_key = os.environ.get("WANDB_API_KEY", "")
 
     cmd = " && ".join(startup)
-    env: dict[str, str] = {"PYTHONUNBUFFERED": "1", "GITHUB_TOKEN": tok}
-    if wandb_key:
-        env["WANDB_API_KEY"] = wandb_key
+    # Only PYTHONUNBUFFERED here — no secrets in the env dict.
+    # GITHUB_TOKEN is already embedded in the git clone URL in the startup script.
+    # WANDB_API_KEY is base64-encoded into the startup script by _base_startup().
+    # Passing secrets as env vars exposes them in plain text in the RunPod pod
+    # details page; embedding them in docker_args keeps them out of that view.
+    env: dict[str, str] = {"PYTHONUNBUFFERED": "1"}
     if env_extra:
         env.update(env_extra)
 
@@ -292,7 +294,9 @@ def _base_startup() -> list[str]:
     """
     tok = get_github_token()
     ssh_pubkey = _read_ssh_pubkey()
-    return [
+    wandb_key = os.environ.get("WANDB_API_KEY", "")
+
+    steps = [
         "export DEBIAN_FRONTEND=noninteractive",
         "apt-get update -qq",
         # python3/python3-venv: needed by uv to create the .venv
@@ -335,6 +339,15 @@ def _base_startup() -> list[str]:
         # Do NOT replace with `pip install torch` — that installs the CPU build.
         "uv sync --extra gpu --quiet",
     ]
+
+    # Embed WANDB_API_KEY via base64 so it stays out of the RunPod env vars table.
+    # Same approach as the SSH pubkey: base64 contains only [A-Za-z0-9+/=], safe
+    # inside bash single-quotes and the GraphQL API string.
+    if wandb_key:
+        encoded = base64.b64encode(wandb_key.encode()).decode()
+        steps.append(f'export WANDB_API_KEY=$(echo {encoded} | base64 -d)')
+
+    return steps
 
 
 def _dataset_and_tokenizer_startup(nanochat_base: str) -> list[str]:
