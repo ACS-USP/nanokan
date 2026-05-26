@@ -92,6 +92,8 @@ Examples
     python scripts/runpod_launch.py download <pod_id>
 """
 
+from __future__ import annotations
+
 import argparse
 import base64
 import os
