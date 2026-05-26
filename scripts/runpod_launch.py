@@ -393,7 +393,7 @@ def _make_train_startup(
     if ffn_type == "grkan":
         cmds += [
             # Install into the project's venv (not system pip)
-            ".venv/bin/pip install rational-kat-cu --quiet",
+            "uv pip install rational-kat-cu --quiet",
             # Fail loudly if the CUDA extension didn't load — better to abort now
             # than discover it mid-training when throughput is 123× too slow.
             # Note: no single quotes inside the python -c string because the entire
@@ -534,14 +534,15 @@ def cmd_volume(args):
 def cmd_test(args):
     get_api_key()
 
-    startup = _base_startup() + [
-        # Always install rational_kat_cu for the smoke test so we catch any
-        # compilation failures before committing to a real training run.
-        ".venv/bin/pip install rational-kat-cu --quiet",
-        ".venv/bin/python scripts/runpod_gpu_test.py",
-        # Stop regardless of test result — don't leave a broken pod running.
-        "runpodctl stop pod $RUNPOD_POD_ID || true",
-    ]
+    # The stop command is placed outside the && chain via a bash trap so the pod
+    # always stops itself even if uv pip install or the test script fails.
+    # Without this, a failing step leaves the pod RUNNING and billing indefinitely.
+    test_block = (
+        "{ uv pip install rational-kat-cu --quiet"
+        " && .venv/bin/python scripts/runpod_gpu_test.py; };"
+        " runpodctl stop pod $RUNPOD_POD_ID || true"
+    )
+    startup = _base_startup() + [test_block]
 
     if args.dry_run:
         print("Startup script (dry run):")
