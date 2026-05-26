@@ -14,10 +14,20 @@ Notable features:
 
 from functools import partial
 from dataclasses import dataclass
+import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+# Optional fused CUDA kernel for GroupRational backward pass.
+# Without it the pure-PyTorch Horner loop is ~123x slower on backward (FlashKAT, arXiv 2505.13813).
+# Install: pip install rational-kat-cu
+try:
+    from rational_kat_cu import rat_cuda as _rat_cuda  # type: ignore
+    _RAT_CUDA_AVAILABLE = True
+except ImportError:
+    _RAT_CUDA_AVAILABLE = False
 
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
 from nanochat.optim import MuonAdamW, DistMuonAdamW
@@ -37,6 +47,11 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # FFN type: "mlp" = standard relu^2 MLP (default), "grkan" = Group-Rational KAN
+    ffn_type: str = "mlp"
+    grkan_groups: int = 8   # number of rational function groups (must divide n_embd and 4*n_embd)
+    grkan_m: int = 5        # numerator polynomial degree
+    grkan_n: int = 4        # denominator polynomial degree
 
 
 def norm(x):
@@ -48,6 +63,91 @@ class Linear(nn.Linear):
     but matmuls run in the activation dtype (typically bf16 from embeddings)."""
     def forward(self, x):
         return F.linear(x, self.weight.to(dtype=x.dtype))
+
+
+class GroupRational(nn.Module):
+    """
+    Group-Rational activation for GR-KAN (Yang & Wang, ICLR 2025).
+
+    Applies g learnable Safe Padé rational functions to groups of input channels:
+        F(x) = (a₀ + a₁x + … + aₘxᵐ) / (1 + |b₁x + … + bₙxⁿ|)
+
+    Numerator coefficients a are shared across all groups; denominator b is per-group.
+    Uses rational_kat_cu fused kernel when available; falls back to PyTorch Horner.
+    Ported from kan-guppylm (Yang & Wang, ICLR 2025).
+    """
+    def __init__(self, d_in: int, num_groups: int = 8, m: int = 5, n: int = 4, init: str = "identity"):
+        super().__init__()
+        if d_in % num_groups != 0:
+            raise ValueError(f"d_in={d_in} must be divisible by num_groups={num_groups}")
+        self.d_in = d_in
+        self.g = num_groups
+        self.d_g = d_in // num_groups
+        self.m = m
+        self.n = n
+        self._init_mode = init
+        self.a = nn.Parameter(torch.zeros(m + 1))       # shared numerator: (m+1,)
+        self.b = nn.Parameter(torch.zeros(num_groups, n)) # per-group denominator: (g, n)
+        self._init_coeffs(init)
+
+    @torch.no_grad()
+    def _init_coeffs(self, init: str):
+        if init == "identity":
+            self.a.zero_()
+            self.a[1] = 1.0
+            self.b.zero_()
+        elif init == "swish":
+            # Fit numerator polynomial to Swish = x·σ(x) via least-squares (b stays 0).
+            x_fit = torch.linspace(-4.0, 4.0, 2000)
+            y_fit = x_fit * torch.sigmoid(x_fit)
+            X = torch.stack([x_fit ** i for i in range(self.m + 1)], dim=1)
+            a_fit = torch.linalg.lstsq(X, y_fit.unsqueeze(1)).solution.squeeze()
+            self.a.copy_(a_fit[: self.m + 1])
+            self.b.zero_()
+        else:
+            nn.init.normal_(self.a, std=0.1)
+            self.b.zero_()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        shape = x.shape
+        x_flat = x.reshape(-1, self.d_in)
+        if _RAT_CUDA_AVAILABLE and x.is_cuda:
+            return _rat_cuda(x_flat, self.a, self.b).reshape(shape)
+        # Pure-PyTorch Horner fallback
+        x_g = x_flat.reshape(-1, self.g, self.d_g)
+        num = self.a[self.m]
+        for i in range(self.m - 1, -1, -1):
+            num = self.a[i] + x_g * num
+        d = self.b[:, -1].view(1, self.g, 1)
+        for i in range(self.n - 2, -1, -1):
+            d = self.b[:, i].view(1, self.g, 1) + x_g * d
+        denom = 1.0 + (x_g * d).abs()
+        return (num / denom).reshape(shape)
+
+
+class GRKANFFN(nn.Module):
+    """
+    Group-Rational KAN FFN: replaces relu^2 MLP with rational activations before each projection.
+
+        rat1(x) → c_fc → rat2(h) → c_proj
+
+    rat1 is initialized to identity (pre-gate before up-projection).
+    rat2 is initialized to approximate Swish (matches the relu^2 role).
+    Parameter overhead over MLP: 2 × [(m+1) + g*n] = 76 params per block — negligible.
+    """
+    def __init__(self, config):
+        super().__init__()
+        hidden = 4 * config.n_embd
+        g, m, n = config.grkan_groups, config.grkan_m, config.grkan_n
+        self.rat1   = GroupRational(config.n_embd, g, m, n, init="identity")
+        self.c_fc   = Linear(config.n_embd, hidden, bias=False)
+        self.rat2   = GroupRational(hidden, g, m, n, init="swish")
+        self.c_proj = Linear(hidden, config.n_embd, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.c_fc(self.rat1(x))
+        x = self.c_proj(self.rat2(x))
+        return x
 
 
 def has_ve(layer_idx, n_layer):
@@ -143,7 +243,7 @@ class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = MLP(config)
+        self.mlp = GRKANFFN(config) if config.ffn_type == "grkan" else MLP(config)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
@@ -228,6 +328,10 @@ class GPT(nn.Module):
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            if self.config.ffn_type == "grkan":
+                # GroupRational _init_coeffs ran on meta device (no-op); re-run now on real device.
+                block.mlp.rat1._init_coeffs(block.mlp.rat1._init_mode)
+                block.mlp.rat2._init_coeffs(block.mlp.rat2._init_mode)
 
         # Per-layer scalars
         # Per-layer resid init: stronger residual at early layers, weaker at deep layers
@@ -376,14 +480,17 @@ class GPT(nn.Module):
         ddp, rank, local_rank, world_size = get_dist_info()
 
         # Separate out all parameters into groups
-        matrix_params = list(self.transformer.h.parameters())
+        all_block_params  = list(self.transformer.h.parameters())
+        # Muon requires 2D+ matrices; 1D params (GroupRational.a coefficients) go to AdamW.
+        matrix_params     = [p for p in all_block_params if p.dim() >= 2]
+        scalar_block_params = [p for p in all_block_params if p.dim() < 2]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
+        assert len(list(self.parameters())) == len(matrix_params) + len(scalar_block_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -399,6 +506,11 @@ class GPT(nn.Module):
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
+        # 1D block params (GroupRational.a coefficients when ffn_type="grkan") → scalar AdamW
+        if scalar_block_params:
+            param_groups.append(dict(kind='adamw', params=scalar_block_params,
+                                     lr=scalar_lr * dmodel_lr_scale, betas=(0.8, 0.95),
+                                     eps=1e-10, weight_decay=0.0))
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
