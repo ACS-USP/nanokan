@@ -162,7 +162,9 @@ LOCAL_DEST = "checkpoints/nanochat"
 DOWNLOAD_WINDOW_HOURS = 2
 
 # Community machines known to have persistent networking issues.
-MACHINE_BLACKLIST: set[str] = set()
+MACHINE_BLACKLIST: set[str] = {
+    "3z47kcltj1d0",  # RTX 5000 Ada — cudaErrorDevicesUnavailable 2026-05-27
+}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
