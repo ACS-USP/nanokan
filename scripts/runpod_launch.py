@@ -302,9 +302,10 @@ def _base_startup() -> list[str]:
         "export DEBIAN_FRONTEND=noninteractive",
         "apt-get update -qq",
         # python3/python3-venv: needed by uv to create the .venv
+        # python3-dev: Python.h headers required by Triton's CUDA backend (torch.compile)
         # git, rsync, openssh-server: repo clone + SSH access
         # curl: uv installer
-        "apt-get install -y git rsync openssh-server python3 python3-venv curl -qq",
+        "apt-get install -y git rsync openssh-server python3 python3-venv python3-dev curl -qq",
 
         # SSH setup (docker_args overrides the container entrypoint, bypassing
         # RunPod's normal SSH injection; the CUDA base image has no sshd).
@@ -416,8 +417,12 @@ def _make_train_startup(
 
     # core-metric-every=-1 disables the expensive DCLM CORE eval during training.
     # Run base_eval.py once after both runs are done to get the final CORE score.
+    # Use a subshell with pipefail so tee doesn't mask torchrun's exit code.
+    # Without this, `torchrun ... | tee` always returns 0 (tee succeeds) and the
+    # && chain incorrectly continues to touch DONE even when training failed.
     train_cmd = (
-        f".venv/bin/torchrun --standalone --nproc_per_node=1 -m scripts.base_train --"
+        f"( set -o pipefail;"
+        f" .venv/bin/torchrun --standalone --nproc_per_node=1 -m scripts.base_train --"
         f" --depth={depth}"
         f" --ffn-type={ffn_type}"
         f" --model-tag={model_tag}"
@@ -425,7 +430,7 @@ def _make_train_startup(
         f" --window-pattern={WINDOW_PATTERN}"
         f" --save-every={SAVE_EVERY}"
         f" --core-metric-every=-1"
-        f" 2>&1 | tee {log_file}"
+        f" 2>&1 | tee {log_file})"
     )
     cmds.append(train_cmd)
 
