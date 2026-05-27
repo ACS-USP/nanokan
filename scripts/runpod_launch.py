@@ -399,10 +399,8 @@ def _make_train_startup(
     # Install rational_kat_cu from our fork. The fork adds a `rational_kat_cu` package
     # that wraps the existing Triton kernels with the interface nanochat/gpt.py expects.
     # No CUDA compilation needed — Triton ships with PyTorch.
-    cmds.append(
-        "uv pip install setuptools --quiet",
-        "uv pip install git+https://github.com/felippe-alves/rational_kat_cu.git --quiet"
-    )
+    cmds.append("uv pip install setuptools --quiet")
+    cmds.append("uv pip install git+https://github.com/felippe-alves/rational_kat_cu.git --quiet")
 
     cmds += _dataset_and_tokenizer_startup(nanochat_base)
 
