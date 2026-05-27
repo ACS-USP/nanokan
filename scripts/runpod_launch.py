@@ -145,7 +145,7 @@ NUM_DATA_SHARDS = 30
 
 # Save a checkpoint every N steps. Essential for community cloud (preemption risk).
 # Use --resume-from-step <N> to restart from a saved checkpoint.
-SAVE_EVERY = 250
+SAVE_EVERY = 2520  # save only at the end (d12 training horizon); reduces download from ~21 GB to ~2 GB
 
 # Sliding-window attention pattern.
 # "L" (full context) for RTX 4090 / A6000 / L40S — PyTorch SDPA has no sliding
@@ -737,7 +737,7 @@ def cmd_download(args):
 
     # Checkpoints are at ~/nanochat_results/ (symlink to NANOCHAT_BASE_DIR)
     results_cmd = [
-        "rsync", "-avz", "--progress", "-e", ssh_opt,
+        "rsync", "-avz", "--partial", "--progress", "-e", ssh_opt,
         f"{remote}:~/nanochat_results/base_checkpoints/", str(dest) + "/",
     ]
     print(f"\nRunning: {' '.join(results_cmd)}")
