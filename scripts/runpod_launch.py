@@ -407,6 +407,12 @@ def _make_train_startup(
     # Use a subshell with pipefail so tee doesn't mask torchrun's exit code.
     # Without this, `torchrun ... | tee` always returns 0 (tee succeeds) and the
     # && chain incorrectly continues to touch DONE even when training failed.
+    # grkan's pure-PyTorch Horner loop keeps more activation intermediates than MLP,
+    # using ~42 GB on L40S at the default device_batch_size=32 before the logits
+    # allocation (65536 × 32768 × fp32 = 8 GB). Halving to 16 halves both activations
+    # and the logits tensor, fitting within 44 GB. grad_accum doubles to compensate.
+    device_batch_size = 16 if ffn_type == "grkan" else 32
+
     train_cmd = (
         f"( set -o pipefail;"
         f" .venv/bin/torchrun --standalone --nproc_per_node=1 -m scripts.base_train --"
@@ -417,6 +423,7 @@ def _make_train_startup(
         f" --window-pattern={WINDOW_PATTERN}"
         f" --save-every={SAVE_EVERY}"
         f" --core-metric-every=-1"
+        f" --device-batch-size={device_batch_size}"
         f" 2>&1 | tee {log_file})"
     )
     # On failure: sleep infinity so the pod stays alive for SSH debugging.
