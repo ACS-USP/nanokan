@@ -145,7 +145,7 @@ NUM_DATA_SHARDS = 30
 
 # Save a checkpoint every N steps. Essential for community cloud (preemption risk).
 # Use --resume-from-step <N> to restart from a saved checkpoint.
-SAVE_EVERY = 2520  # save only at the end (d12 training horizon); reduces download from ~21 GB to ~2 GB
+SAVE_EVERY = 500  # checkpoint every ~8 min on L40S; at most 8 min lost on preemption
 
 # Sliding-window attention pattern.
 # "L" (full context) for RTX 4090 / A6000 / L40S — PyTorch SDPA has no sliding
@@ -385,33 +385,37 @@ def _make_train_startup(
     ffn_type: str,
     nanochat_base: str,
     run_name: str,
+    smoke: bool = False,
 ) -> list[str]:
     cmds = _base_startup()
 
-    # NOTE: rational_kat_cu CUDA kernel is NOT currently installable.
-    # The Adamdad/rational_kat_cu repo (kat-rational==0.4) has ext_modules commented
-    # out in setup.py, so no CUDA extension compiles and `rational_kat_cu` is never
-    # importable. nanochat/gpt.py handles this gracefully: _RAT_CUDA_AVAILABLE=False
-    # and GroupRational uses the pure-PyTorch Horner fallback instead.
-    # Training is correct but ~2-5x slower for grkan FFN backward passes.
-    # TODO: fork the repo, uncomment ext_modules with name='rational_kat_cu', and fix
-    #       gpt.py to use rational_fwd_1dgroup / rational_bwd_1dgroup via autograd.Function.
+    # Install rational_kat_cu from our fork. The fork adds a `rational_kat_cu` package
+    # that wraps the existing Triton kernels with the interface nanochat/gpt.py expects.
+    # No CUDA compilation needed — Triton ships with PyTorch.
+    cmds.append(
+        "uv pip install git+https://github.com/felippe-alves/rational_kat_cu.git --quiet"
+    )
 
     cmds += _dataset_and_tokenizer_startup(nanochat_base)
 
     model_tag = f"d{depth}-{ffn_type}"
     log_file = f"{nanochat_base}/{model_tag}_train.log"
 
-    # core-metric-every=-1 disables the expensive DCLM CORE eval during training.
-    # Run base_eval.py once after both runs are done to get the final CORE score.
-    # Use a subshell with pipefail so tee doesn't mask torchrun's exit code.
-    # Without this, `torchrun ... | tee` always returns 0 (tee succeeds) and the
-    # && chain incorrectly continues to touch DONE even when training failed.
-    # grkan's pure-PyTorch Horner loop keeps more activation intermediates than MLP,
-    # using ~42 GB on L40S at the default device_batch_size=32 before the logits
-    # allocation (65536 × 32768 × fp32 = 8 GB). Halving to 16 halves both activations
-    # and the logits tensor, fitting within 44 GB. grad_accum doubles to compensate.
-    device_batch_size = 16 if ffn_type == "grkan" else 32
+    # Auto-resume: detect the last checkpoint on the volume and continue from there
+    # instead of restarting from zero after a preemption. No-op on a fresh run.
+    ckpt_dir = f"{nanochat_base}/base_checkpoints/{run_name}"
+    resume_snippet = (
+        f"LAST_STEP=$(ls {ckpt_dir}/model_*.pt 2>/dev/null"
+        r" | sed 's/.*model_0*//' | sed 's/\.pt//' | sort -n | tail -1);"
+        f" if [ -n \"$LAST_STEP\" ] && [ \"$LAST_STEP\" -gt 0 ];"
+        f" then RESUME_FLAG=\"--resume-from-step $LAST_STEP\";"
+        f" echo \"Resuming from step $LAST_STEP\";"
+        f" else RESUME_FLAG=\"\"; echo \"Starting from scratch\"; fi"
+    )
+    cmds.append(resume_snippet)
+
+    save_every = 10 if smoke else SAVE_EVERY
+    extra_flags = " --max-steps=10" if smoke else ""
 
     train_cmd = (
         f"( set -o pipefail;"
@@ -421,9 +425,11 @@ def _make_train_startup(
         f" --model-tag={model_tag}"
         f" --run={run_name}"
         f" --window-pattern={WINDOW_PATTERN}"
-        f" --save-every={SAVE_EVERY}"
+        f" --save-every={save_every}"
         f" --core-metric-every=-1"
-        f" --device-batch-size={device_batch_size}"
+        f" --device-batch-size=32"
+        f" $RESUME_FLAG"
+        f"{extra_flags}"
         f" 2>&1 | tee {log_file})"
     )
     # On failure: sleep infinity so the pod stays alive for SSH debugging.
@@ -600,12 +606,14 @@ def cmd_train(args):
 
     nanochat_base = NANOCHAT_CACHE_ON_VOLUME if args.volume_id else "${HOME}/.cache/nanochat"
     run_name = f"d{args.depth}-{args.ffn_type}"
+    smoke = getattr(args, "smoke", False)
 
     startup = _make_train_startup(
         depth=args.depth,
         ffn_type=args.ffn_type,
         nanochat_base=nanochat_base,
         run_name=run_name,
+        smoke=smoke,
     )
 
     if args.dry_run:
@@ -909,6 +917,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_train.add_argument("--gpu", default=None, help="Force a specific GPU type")
     p_train.add_argument("--volume-id", default=None,
                          help="Persistent volume ID. Strongly recommended for community cloud.")
+    p_train.add_argument("--smoke", action="store_true",
+                         help="Smoke-test mode: 10 steps, save-every=10, verify pipeline then stop.")
     p_train.add_argument("--dry-run", action="store_true",
                          help="Print startup script without launching")
 
