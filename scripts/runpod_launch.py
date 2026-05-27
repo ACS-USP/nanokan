@@ -258,10 +258,8 @@ def find_and_launch_pod(
     disk_gb: int = 60,
     env_extra: dict | None = None,
 ) -> tuple[str, dict]:
-    candidates = (
-        [preferred_gpu] + [g for g in GPU_PREFERENCE if g != preferred_gpu]
-        if preferred_gpu else GPU_PREFERENCE
-    )
+    # If a specific GPU is requested, only try that one — do not fall through to others.
+    candidates = [preferred_gpu] if preferred_gpu else GPU_PREFERENCE
     print("Finding available GPU …")
     for gpu in candidates:
         try:
@@ -390,30 +388,14 @@ def _make_train_startup(
 ) -> list[str]:
     cmds = _base_startup()
 
-    # Install rational_kat_cu for grkan runs.
-    # Requires nvcc (the -devel image provides it); takes ~30s to compile.
-    # The mlp baseline does not need this.
-    if ffn_type == "grkan":
-        cmds += [
-            # rational-kat-cu is not on PyPI — must install from source via git.
-            # --no-build-isolation: setup.py imports torch, which only exists in the
-            # venv; the default isolated build env doesn't have it and fails.
-            # setuptools must be pre-installed in the venv before --no-build-isolation
-            # can work (setup.py needs it and it's not in the venv by default).
-            "uv pip install setuptools --quiet",
-            "uv pip install git+https://github.com/Adamdad/rational_kat_cu.git --no-build-isolation --quiet",
-            # Fail loudly if the CUDA extension didn't load — better to abort now
-            # than discover it mid-training when throughput is 123× too slow.
-            # Note: no double quotes allowed inside docker_args — the RunPod SDK
-            # does not escape them in the GraphQL mutation string, causing a syntax
-            # error.  Use printf+file to avoid any embedded quotes entirely.
-            (
-                "printf 'from nanochat.gpt import _RAT_CUDA_AVAILABLE\\nimport sys\\n"
-                "sys.exit(0 if _RAT_CUDA_AVAILABLE else 1)\\n' > /tmp/_rat_check.py"
-                " && .venv/bin/python /tmp/_rat_check.py"
-                " || { echo FATAL: rational_kat_cu CUDA kernel not loaded; exit 1; }"
-            ),
-        ]
+    # NOTE: rational_kat_cu CUDA kernel is NOT currently installable.
+    # The Adamdad/rational_kat_cu repo (kat-rational==0.4) has ext_modules commented
+    # out in setup.py, so no CUDA extension compiles and `rational_kat_cu` is never
+    # importable. nanochat/gpt.py handles this gracefully: _RAT_CUDA_AVAILABLE=False
+    # and GroupRational uses the pure-PyTorch Horner fallback instead.
+    # Training is correct but ~2-5x slower for grkan FFN backward passes.
+    # TODO: fork the repo, uncomment ext_modules with name='rational_kat_cu', and fix
+    #       gpt.py to use rational_fwd_1dgroup / rational_bwd_1dgroup via autograd.Function.
 
     cmds += _dataset_and_tokenizer_startup(nanochat_base)
 
@@ -437,7 +419,14 @@ def _make_train_startup(
         f" --core-metric-every=-1"
         f" 2>&1 | tee {log_file})"
     )
-    cmds.append(train_cmd)
+    # On failure: sleep infinity so the pod stays alive for SSH debugging.
+    # exit 1 (or pipefail) would cause RunPod to restart the container in a loop.
+    # The log at {log_file} contains the full Python traceback before the torchrun
+    # ChildFailedError — check it first when debugging.
+    cmds.append(
+        f"{train_cmd}"
+        f" || {{ echo TRAINING FAILED — pod sleeping for debug. Check log: {log_file}; sleep infinity; }}"
+    )
 
     # Keep pod alive after training for SSH download.
     # Pod auto-terminates after DOWNLOAD_WINDOW_HOURS if not terminated sooner.

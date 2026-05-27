@@ -92,6 +92,8 @@ class GroupRational(nn.Module):
 
     @torch.no_grad()
     def _init_coeffs(self, init: str):
+        if self.a.is_meta:
+            return  # no-op on meta device; init_weights() re-calls this after to_empty()
         if init == "identity":
             self.a.zero_()
             self.a[1] = 1.0
