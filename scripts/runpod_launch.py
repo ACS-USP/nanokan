@@ -119,6 +119,8 @@ DOCKER_IMAGE = "nvidia/cuda:12.9.2-cudnn-devel-ubuntu22.04"
 
 # GPU preference: cheapest 24 GB+ first. All support CUDA 12.8 (driver >= 570.xx).
 GPU_PREFERENCE = [
+    "NVIDIA H100 PCIe",               # 80 GB ~$2.49/hr — target for grkan full run
+    "NVIDIA H100 80GB HBM3",          # 80 GB ~$2.99/hr — H100 SXM fallback
     "NVIDIA GeForce RTX 4090",        # 24 GB ~$0.34/hr — best value for d12
     "NVIDIA RTX PRO 4500 Blackwell",  # 32 GB ~$0.34/hr — EU-RO-1 available
     "NVIDIA RTX A6000",               # 48 GB ~$0.33/hr
@@ -421,7 +423,7 @@ def _make_train_startup(
     cmds.append(f"echo {encoded_resume} | base64 -d > /tmp/resume.sh && . /tmp/resume.sh")
 
     save_every = 10 if smoke else SAVE_EVERY
-    extra_flags = " --max-steps=10" if smoke else ""
+    extra_flags = " --num-iterations=10" if smoke else ""
 
     train_cmd = (
         f"( set -o pipefail;"
