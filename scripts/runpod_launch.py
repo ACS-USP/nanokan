@@ -390,6 +390,7 @@ def _make_train_startup(
     nanochat_base: str,
     run_name: str,
     smoke: bool = False,
+    save_every_override: int | None = None,
 ) -> list[str]:
     cmds = _base_startup()
 
@@ -424,7 +425,12 @@ def _make_train_startup(
     encoded_resume = base64.b64encode(resume_bash.encode()).decode()
     cmds.append(f"echo {encoded_resume} | base64 -d > /tmp/resume.sh && . /tmp/resume.sh")
 
-    save_every = 10 if smoke else SAVE_EVERY
+    if save_every_override is not None:
+        save_every = save_every_override
+    elif smoke:
+        save_every = 10
+    else:
+        save_every = SAVE_EVERY
     # device_batch_size=16 fits on any ≥24 GB GPU; total_batch_size is fixed at 524,288 tokens
     # by the model config, so grad_accum_steps scales up automatically — training quality identical.
     device_batch_size = 16
@@ -627,6 +633,7 @@ def cmd_train(args):
         nanochat_base=nanochat_base,
         run_name=run_name,
         smoke=smoke,
+        save_every_override=getattr(args, "save_every", None),
     )
 
     if args.dry_run:
@@ -886,7 +893,26 @@ def cmd_watch(args):
             cmd_download(dl_args)
             return
 
-        print(f"[{time.strftime('%H:%M')}] Still training … next check in {poll_minutes} min.")
+        print(f"[{time.strftime('%H:%M')}] Still training … syncing checkpoints …")
+        dest.mkdir(parents=True, exist_ok=True)
+        ssh_opt = f"ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -p {ssh_port}"
+        sync = subprocess.run(
+            [
+                "rsync", "-az", "--ignore-existing", "--partial",
+                "--include=*/", "--include=model_*.pt", "--include=meta_*.json",
+                "--exclude=*",
+                "-e", ssh_opt,
+                f"root@{ssh_ip}:~/nanochat_results/base_checkpoints/",
+                str(dest) + "/",
+            ],
+            capture_output=True, text=True,
+        )
+        new_ckpts = [l.strip() for l in sync.stdout.splitlines() if l.strip().endswith(".pt")]
+        if new_ckpts:
+            print(f"  Downloaded: {', '.join(new_ckpts)}")
+        elif sync.returncode not in (0, 23, 24):
+            print(f"  WARNING: rsync exited {sync.returncode}: {sync.stderr.strip()[:120]}")
+        print(f"  Next check in {poll_minutes} min.")
         time.sleep(poll_minutes * 60)
 
 
@@ -934,6 +960,8 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Persistent volume ID. Strongly recommended for community cloud.")
     p_train.add_argument("--smoke", action="store_true",
                          help="Smoke-test mode: 10 steps, save-every=10, verify pipeline then stop.")
+    p_train.add_argument("--save-every", dest="save_every", type=int, default=None,
+                         help="Override save-every (checkpoints per N steps). Overrides smoke default.")
     p_train.add_argument("--secure", action="store_true",
                          help="Use secure cloud (no preemption). Costs more but guaranteed uptime.")
     p_train.add_argument("--dry-run", action="store_true",
