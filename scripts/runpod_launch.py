@@ -403,16 +403,22 @@ def _make_train_startup(
 
     # Auto-resume: detect the last checkpoint on the volume and continue from there
     # instead of restarting from zero after a preemption. No-op on a fresh run.
+    # The logic uses double quotes and $ expansions which are illegal in GraphQL strings,
+    # so encode it as base64 and decode+source it on the pod at runtime.
     ckpt_dir = f"{nanochat_base}/base_checkpoints/{run_name}"
-    resume_snippet = (
-        f"LAST_STEP=$(ls {ckpt_dir}/model_*.pt 2>/dev/null"
-        " | sed 's/.*model_0*//' | sed 's/[.]pt//' | sort -n | tail -1);"
-        f" if [ -n \"$LAST_STEP\" ] && [ \"$LAST_STEP\" -gt 0 ];"
-        f" then RESUME_FLAG=\"--resume-from-step $LAST_STEP\";"
-        f" echo \"Resuming from step $LAST_STEP\";"
-        f" else RESUME_FLAG=\"\"; echo \"Starting from scratch\"; fi"
+    resume_bash = (
+        f'LAST_STEP=$(ls {ckpt_dir}/model_*.pt 2>/dev/null'
+        " | sed 's/.*model_0*//' | sed 's/[.]pt//' | sort -n | tail -1)\n"
+        'if [ -n "$LAST_STEP" ] && [ "$LAST_STEP" -gt 0 ]; then\n'
+        '  RESUME_FLAG="--resume-from-step $LAST_STEP"\n'
+        '  echo "Resuming from step $LAST_STEP"\n'
+        'else\n'
+        '  RESUME_FLAG=""\n'
+        '  echo "Starting from scratch"\n'
+        'fi'
     )
-    cmds.append(resume_snippet)
+    encoded_resume = base64.b64encode(resume_bash.encode()).decode()
+    cmds.append(f"echo {encoded_resume} | base64 -d > /tmp/resume.sh && . /tmp/resume.sh")
 
     save_every = 10 if smoke else SAVE_EVERY
     extra_flags = " --max-steps=10" if smoke else ""
