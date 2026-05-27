@@ -398,6 +398,9 @@ def _make_train_startup(
             # rational-kat-cu is not on PyPI — must install from source via git.
             # --no-build-isolation: setup.py imports torch, which only exists in the
             # venv; the default isolated build env doesn't have it and fails.
+            # setuptools must be pre-installed in the venv before --no-build-isolation
+            # can work (setup.py needs it and it's not in the venv by default).
+            "uv pip install setuptools --quiet",
             "uv pip install git+https://github.com/Adamdad/rational_kat_cu.git --no-build-isolation --quiet",
             # Fail loudly if the CUDA extension didn't load — better to abort now
             # than discover it mid-training when throughput is 123× too slow.
