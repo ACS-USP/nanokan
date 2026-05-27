@@ -406,7 +406,7 @@ def _make_train_startup(
     ckpt_dir = f"{nanochat_base}/base_checkpoints/{run_name}"
     resume_snippet = (
         f"LAST_STEP=$(ls {ckpt_dir}/model_*.pt 2>/dev/null"
-        r" | sed 's/.*model_0*//' | sed 's/\.pt//' | sort -n | tail -1);"
+        " | sed 's/.*model_0*//' | sed 's/[.]pt//' | sort -n | tail -1);"
         f" if [ -n \"$LAST_STEP\" ] && [ \"$LAST_STEP\" -gt 0 ];"
         f" then RESUME_FLAG=\"--resume-from-step $LAST_STEP\";"
         f" echo \"Resuming from step $LAST_STEP\";"
