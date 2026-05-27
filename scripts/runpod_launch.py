@@ -423,6 +423,9 @@ def _make_train_startup(
     cmds.append(f"echo {encoded_resume} | base64 -d > /tmp/resume.sh && . /tmp/resume.sh")
 
     save_every = 10 if smoke else SAVE_EVERY
+    # Smoke test uses device_batch_size=16 so the 2 GB logits tensor fits on any ≥24 GB GPU.
+    # Full run uses 32 — the target GPU (H100, L40S, A100) has ≥48 GB and handles 4 GB logits easily.
+    device_batch_size = 16 if smoke else 32
     extra_flags = " --num-iterations=10" if smoke else ""
 
     train_cmd = (
@@ -435,7 +438,7 @@ def _make_train_startup(
         f" --window-pattern={WINDOW_PATTERN}"
         f" --save-every={save_every}"
         f" --core-metric-every=-1"
-        f" --device-batch-size=32"
+        f" --device-batch-size={device_batch_size}"
         f" $RESUME_FLAG"
         f"{extra_flags}"
         f" 2>&1 | tee {log_file})"
