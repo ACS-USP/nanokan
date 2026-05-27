@@ -768,7 +768,7 @@ def cmd_download(args):
 
     # Checkpoints are at ~/nanochat_results/ (symlink to NANOCHAT_BASE_DIR)
     results_cmd = [
-        "rsync", "-avz", "--partial", "--progress", "-e", ssh_opt,
+        "rsync", "-av", "--partial", "--progress", "-e", ssh_opt,
         f"{remote}:~/nanochat_results/base_checkpoints/", str(dest) + "/",
     ]
     print(f"\nRunning: {' '.join(results_cmd)}")
@@ -780,7 +780,7 @@ def cmd_download(args):
 
     # Also grab training logs (exit 23 = no matching files — not an error)
     logs_cmd = [
-        "rsync", "-avz", "--progress", "-e", ssh_opt,
+        "rsync", "-av", "--progress", "-e", ssh_opt,
         f"{remote}:~/nanochat_results/*_train.log", str(dest) + "/",
     ]
     print(f"\nRunning: {' '.join(logs_cmd)}")
@@ -914,7 +914,7 @@ def cmd_watch(args):
         dest.mkdir(parents=True, exist_ok=True)
         sync = subprocess.run(
             [
-                "rsync", "-az", "--ignore-existing", "--partial",
+                "rsync", "-a", "--ignore-existing", "--partial",
                 "--include=*/", "--include=model_*.pt", "--include=meta_*.json",
                 "--exclude=*",
                 "-e", ssh_opt,
