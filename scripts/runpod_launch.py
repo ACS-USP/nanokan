@@ -396,9 +396,9 @@ def _make_train_startup(
     if ffn_type == "grkan":
         cmds += [
             # rational-kat-cu is not on PyPI — must install from source via git.
-            # uv pip install fails with "not found in registry" for non-PyPI packages.
-            # Building from source requires nvcc (available on the -devel image).
-            "uv pip install git+https://github.com/Adamdad/rational_kat_cu.git --quiet",
+            # --no-build-isolation: setup.py imports torch, which only exists in the
+            # venv; the default isolated build env doesn't have it and fails.
+            "uv pip install git+https://github.com/Adamdad/rational_kat_cu.git --no-build-isolation --quiet",
             # Fail loudly if the CUDA extension didn't load — better to abort now
             # than discover it mid-training when throughput is 123× too slow.
             # Note: no double quotes allowed inside docker_args — the RunPod SDK
