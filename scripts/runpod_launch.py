@@ -864,7 +864,9 @@ def cmd_watch(args):
     # Sentinel written by startup script after training finishes.
     # Model tag unknown here (could be d12-mlp or d12-grkan), so check either.
     check_cmd = "ls ~/nanochat_results/DONE_* 2>/dev/null && echo done || echo running"
+    ssh_opt = f"ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -p {ssh_port}"
     ssh_failures = 0
+    log_line_offset = 1  # next unread line in the remote training log (1-indexed)
 
     while True:
         r = subprocess.run(
@@ -882,6 +884,20 @@ def cmd_watch(args):
             continue
 
         ssh_failures = 0
+
+        # Stream new log lines before acting on the status.
+        log_r = subprocess.run(
+            ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+             "-p", str(ssh_port), f"root@{ssh_ip}",
+             f"awk 'NR>={log_line_offset}' ~/nanochat_results/*_train.log 2>/dev/null"],
+            capture_output=True, text=True,
+        )
+        if log_r.returncode == 0 and log_r.stdout.strip():
+            new_lines = log_r.stdout.splitlines()
+            log_line_offset += len(new_lines)
+            for line in new_lines:
+                print(f"  {line}")
+
         status = r.stdout.strip().splitlines()[-1]
         if status == "done":
             print(f"[{time.strftime('%H:%M')}] Training finished! Starting download …\n")
@@ -897,7 +913,6 @@ def cmd_watch(args):
 
         print(f"[{time.strftime('%H:%M')}] Still training … syncing checkpoints …")
         dest.mkdir(parents=True, exist_ok=True)
-        ssh_opt = f"ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -p {ssh_port}"
         sync = subprocess.run(
             [
                 "rsync", "-az", "--ignore-existing", "--partial",
