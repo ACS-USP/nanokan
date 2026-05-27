@@ -395,8 +395,10 @@ def _make_train_startup(
     # The mlp baseline does not need this.
     if ffn_type == "grkan":
         cmds += [
-            # Install into the project's venv (not system pip)
-            "uv pip install rational-kat-cu --quiet",
+            # rational-kat-cu is not on PyPI — must install from source via git.
+            # uv pip install fails with "not found in registry" for non-PyPI packages.
+            # Building from source requires nvcc (available on the -devel image).
+            "uv pip install git+https://github.com/Adamdad/rational_kat_cu.git --quiet",
             # Fail loudly if the CUDA extension didn't load — better to abort now
             # than discover it mid-training when throughput is 123× too slow.
             # Note: no double quotes allowed inside docker_args — the RunPod SDK
