@@ -201,6 +201,7 @@ def _try_launch_pod(
     volume_id: str | None,
     disk_gb: int,
     env_extra: dict | None = None,
+    secure: bool = False,
 ) -> dict | None:
     import time
 
@@ -220,7 +221,7 @@ def _try_launch_pod(
         name=name,
         image_name=DOCKER_IMAGE,
         gpu_type_id=gpu_type_id,
-        cloud_type="COMMUNITY",
+        cloud_type="SECURE" if secure else "COMMUNITY",
         container_disk_in_gb=disk_gb,
         start_ssh=True,
         support_public_ip=True,
@@ -259,13 +260,14 @@ def find_and_launch_pod(
     volume_id: str | None = None,
     disk_gb: int = 60,
     env_extra: dict | None = None,
+    secure: bool = False,
 ) -> tuple[str, dict]:
     # If a specific GPU is requested, only try that one — do not fall through to others.
     candidates = [preferred_gpu] if preferred_gpu else GPU_PREFERENCE
     print("Finding available GPU …")
     for gpu in candidates:
         try:
-            pod = _try_launch_pod(name, gpu, startup, volume_id, disk_gb, env_extra)
+            pod = _try_launch_pod(name, gpu, startup, volume_id, disk_gb, env_extra, secure=secure)
             print(f"  Selected: {gpu}")
             return gpu, pod
         except RuntimeError as e:
@@ -650,12 +652,14 @@ def cmd_train(args):
         print("  Volume  : none (checkpoints only on pod disk — risky on community cloud!)")
     print(f"  Est. time: ~{est_hours:.1f}h")
 
+    secure = getattr(args, "secure", False)
     gpu, pod = find_and_launch_pod(
         name=f"nanochat-{run_name}",
         startup=startup,
         preferred_gpu=args.gpu,
         volume_id=args.volume_id,
         disk_gb=60,
+        secure=secure,
     )
     pod_id = pod["id"]
     cost = pod.get("costPerHr", "?")
@@ -930,6 +934,8 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Persistent volume ID. Strongly recommended for community cloud.")
     p_train.add_argument("--smoke", action="store_true",
                          help="Smoke-test mode: 10 steps, save-every=10, verify pipeline then stop.")
+    p_train.add_argument("--secure", action="store_true",
+                         help="Use secure cloud (no preemption). Costs more but guaranteed uptime.")
     p_train.add_argument("--dry-run", action="store_true",
                          help="Print startup script without launching")
 
