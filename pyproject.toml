@@ -9,6 +9,7 @@ dependencies = [
     "fastapi>=0.117.1",
     "kernels>=0.11.7",
     "psutil>=7.1.0",
+    "runpod>=1.7.13",
     "rustbpe>=0.1.0",
     "tiktoken>=0.11.0",
     "tokenizers>=0.22.0",

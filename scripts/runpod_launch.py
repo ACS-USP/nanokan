@@ -17,6 +17,11 @@ Subcommands
       rsync checkpoints from a stopped pod to local disk, then offer to terminate.
       Requires your SSH public key to be registered in RunPod settings.
 
+  eval     [--model-tags TAGS] [--gpu GPU] [--dry-run]
+      Launch an eval pod, rsync local checkpoints up, run CORE+BPB on each
+      model tag, download result CSVs, terminate pod.
+      TAGS is a comma-separated list (default: d12-grkan,d12-mlp).
+
   watch    <pod_id> [--dest DIR] [--interval MINUTES]
       Poll the pod every N minutes; auto-download when training finishes.
 
@@ -104,8 +109,7 @@ from pathlib import Path
 try:
     import runpod
 except ImportError:
-    print("ERROR: runpod SDK not installed.  Run: pip install runpod")
-    sys.exit(1)
+    runpod = None
 
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -169,12 +173,25 @@ MACHINE_BLACKLIST: set[str] = {
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+def _require_runpod():
+    global runpod
+    if runpod is not None:
+        return runpod
+    try:
+        import runpod as runpod_module
+    except ImportError:
+        print("ERROR: runpod SDK not installed.  Run: uv add runpod")
+        sys.exit(1)
+    runpod = runpod_module
+    return runpod
+
 def get_api_key() -> str:
+    rp = _require_runpod()
     key = os.environ.get("RUNPOD_API_KEY", "")
     if not key:
         print("ERROR: RUNPOD_API_KEY not set.  Run: export RUNPOD_API_KEY=<your-key>")
         sys.exit(1)
-    runpod.api_key = key
+    rp.api_key = key
     return key
 
 
@@ -393,6 +410,7 @@ def _make_train_startup(
     run_name: str,
     smoke: bool = False,
     save_every_override: int | None = None,
+    num_iterations: int | None = None,
 ) -> list[str]:
     cmds = _base_startup()
 
@@ -413,8 +431,16 @@ def _make_train_startup(
     # so encode it as base64 and decode+source it on the pod at runtime.
     ckpt_dir = f"{nanochat_base}/base_checkpoints/{run_name}"
     resume_bash = (
-        f'LAST_STEP=$(ls {ckpt_dir}/model_*.pt 2>/dev/null'
-        " | sed 's/.*model_0*//' | sed 's/[.]pt//' | sort -n | tail -1)\n"
+        f"CKPT_DIR={ckpt_dir}\n"
+        'LAST_STEP=$(\n'
+        '  for model_path in "$CKPT_DIR"/model_*.pt; do\n'
+        '    [ -e "$model_path" ] || continue\n'
+        '    step=$(basename "$model_path" | sed "s/model_0*//" | sed "s/[.]pt//")\n'
+        '    [ -f "$CKPT_DIR/meta_$(printf "%06d" "$step").json" ] || continue\n'
+        '    [ -f "$CKPT_DIR/optim_$(printf "%06d" "$step")_rank0.pt" ] || continue\n'
+        '    echo "$step"\n'
+        '  done | sort -n | tail -1\n'
+        ')\n'
         'if [ -n "$LAST_STEP" ] && [ "$LAST_STEP" -gt 0 ]; then\n'
         '  RESUME_FLAG="--resume-from-step $LAST_STEP"\n'
         '  echo "Resuming from step $LAST_STEP"\n'
@@ -432,10 +458,15 @@ def _make_train_startup(
         save_every = 10
     else:
         save_every = SAVE_EVERY
-    # device_batch_size=16 fits on any ≥24 GB GPU; total_batch_size is fixed at 524,288 tokens
-    # by the model config, so grad_accum_steps scales up automatically — training quality identical.
-    device_batch_size = 16
-    extra_flags = " --num-iterations=10" if smoke else ""
+    # device_batch_size=32 needs ≥50 GB VRAM (H100/A100); grad_accum halved to 8 → fewer
+    # graph-break dispatches per step. Falls back to 16 on smaller GPUs if needed.
+    device_batch_size = 32
+    if smoke:
+        extra_flags = " --num-iterations=10"
+    elif num_iterations is not None:
+        extra_flags = f" --num-iterations={num_iterations}"
+    else:
+        extra_flags = ""
 
     train_cmd = (
         f"( set -o pipefail;"
@@ -458,7 +489,7 @@ def _make_train_startup(
     # ChildFailedError — check it first when debugging.
     cmds.append(
         f"{train_cmd}"
-        f" || {{ echo TRAINING FAILED — pod sleeping for debug. Check log: {log_file}; sleep infinity; }}"
+        f" || {{ touch {nanochat_base}/FAILED_{model_tag}; echo TRAINING FAILED — pod sleeping for debug. Check log: {log_file}; sleep infinity; }}"
     )
 
     # Keep pod alive after training for SSH download.
@@ -591,7 +622,7 @@ def cmd_test(args):
     # always stops itself even if uv pip install or the test script fails.
     # Without this, a failing step leaves the pod RUNNING and billing indefinitely.
     test_block = (
-        "{ uv pip install rational-kat-cu --quiet"
+        "{ uv pip install git+https://github.com/felippe-alves/rational_kat_cu.git --quiet"
         " && .venv/bin/python scripts/runpod_gpu_test.py; };"
         " runpodctl stop pod $RUNPOD_POD_ID || true"
     )
@@ -635,6 +666,7 @@ def cmd_train(args):
         run_name=run_name,
         smoke=smoke,
         save_every_override=getattr(args, "save_every", None),
+        num_iterations=getattr(args, "num_iterations", None),
     )
 
     if args.dry_run:
@@ -778,6 +810,17 @@ def cmd_download(args):
         print(f"Try manually: ssh -p {ssh_port} root@{ssh_ip}")
         sys.exit(1)
 
+    # Also grab the tokenizer — needed for local eval (base_eval.py --model-tag).
+    tok_dest = Path(dest) / "tokenizer"
+    tok_cmd = [
+        "rsync", "-av", "--partial", "--progress", "-e", ssh_opt,
+        f"{remote}:~/nanochat_results/tokenizer/", str(tok_dest) + "/",
+    ]
+    print(f"\nRunning: {' '.join(tok_cmd)}")
+    result = subprocess.run(tok_cmd)
+    if result.returncode not in (0, 23):
+        print(f"WARNING: tokenizer rsync exited {result.returncode} (non-fatal; needed for local eval)")
+
     # Also grab training logs (exit 23 = no matching files — not an error)
     logs_cmd = [
         "rsync", "-av", "--progress", "-e", ssh_opt,
@@ -802,6 +845,522 @@ def cmd_download(args):
     else:
         print(f"Pod kept. Terminate later with:")
         print(f"  python scripts/runpod_launch.py terminate {args.pod_id}")
+
+
+# ── Subcommand: eval ──────────────────────────────────────────────────────────
+
+# RTX 4090 is sufficient for inference (24 GB, ~$0.34/hr).
+EVAL_GPU_PREFERENCE = [
+    # Cheap 24–32 GB (prefer first)
+    "NVIDIA GeForce RTX 4090",        # 24 GB ~$0.34/hr
+    "NVIDIA RTX PRO 4500 Blackwell",  # 32 GB ~$0.34/hr
+    "NVIDIA GeForce RTX 3090",        # 24 GB ~$0.24/hr
+    "NVIDIA GeForce RTX 3090 Ti",     # 24 GB ~$0.29/hr
+    "NVIDIA RTX A5000",               # 24 GB ~$0.30/hr
+    "NVIDIA RTX A4500",               # 20 GB ~$0.28/hr
+    # Mid-range 48 GB
+    "NVIDIA RTX A6000",               # 48 GB ~$0.33/hr
+    "NVIDIA A40",                     # 48 GB ~$0.49/hr
+    "NVIDIA L40",                     # 48 GB ~$0.69/hr
+    "NVIDIA L40S",                    # 48 GB ~$0.79/hr
+    "NVIDIA RTX 6000 Ada Generation", # 48 GB ~$0.79/hr
+    # 24–32 GB Ada generation
+    "NVIDIA L4",                      # 24 GB ~$0.44/hr
+    "NVIDIA RTX 5000 Ada Generation", # 32 GB ~$0.49/hr
+    "NVIDIA RTX 4000 Ada Generation", # 20 GB ~$0.35/hr
+    "NVIDIA RTX PRO 4000 Blackwell",  # 24 GB
+    # A100 / H100 (expensive but highly available on secure cloud)
+    "NVIDIA A100 80GB PCIe",          # 80 GB ~$1.89/hr
+    "NVIDIA A100-SXM4-80GB",          # 80 GB ~$2.29/hr
+    "NVIDIA H100 PCIe",               # 80 GB ~$2.49/hr
+    "NVIDIA H100 80GB HBM3",          # 80 GB ~$2.99/hr
+]
+
+
+def _make_eval_startup(nanochat_base: str, upload_tokenizer: bool = False) -> list[str]:
+    """
+    Pod startup for eval: base env + rational_kat_cu.
+
+    If upload_tokenizer=True (caller will rsync tokenizer from local), skips
+    tokenizer training and writes READY_FOR_EVAL immediately after env setup.
+
+    If upload_tokenizer=False (no local tokenizer), downloads a minimum set of
+    ClimbMix shards and trains the tokenizer before writing the sentinel — this
+    adds ~5–8 min but produces the correct vocabulary.
+    """
+    cmds = _base_startup()
+    cmds.append("uv pip install setuptools --quiet")
+    cmds.append("uv pip install git+https://github.com/felippe-alves/rational_kat_cu.git --quiet")
+    cmds += [
+        f"export NANOCHAT_BASE_DIR={nanochat_base}",
+        f"mkdir -p {nanochat_base}/base_checkpoints",
+        f"ln -sfn {nanochat_base} ~/nanochat_results",
+    ]
+    if not upload_tokenizer:
+        # Must use the same 30 shards as training to reproduce the exact vocabulary.
+        # Fewer shards produce a different token distribution → wrong embedding lookup
+        # → near-random outputs (confirmed: 5-shard tokenizer gave BPB=2.28 vs 0.856).
+        tok_block = (
+            f"if [ ! -f {nanochat_base}/tokenizer/tokenizer.pkl ]; then"
+            f" .venv/bin/python -m nanochat.dataset -n {NUM_DATA_SHARDS} -w 4"
+            f" && .venv/bin/python -m scripts.tok_train --max-chars=2000000000 --vocab-size=32768"
+            "; fi"
+        )
+        cmds.append(tok_block)
+    cmds += [
+        f"touch {nanochat_base}/READY_FOR_EVAL",
+        "echo Environment ready. Waiting for checkpoint rsync and eval trigger.",
+        "sleep infinity",
+    ]
+    return cmds
+
+
+def _wait_for_ssh(ssh_ip: str, ssh_port: int, timeout_attempts: int = 36) -> None:
+    """Poll SSH until it accepts connections (up to ~6 min)."""
+    import time
+    print("Waiting for sshd ", end="", flush=True)
+    for _ in range(timeout_attempts):
+        r = subprocess.run(
+            ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5",
+             "-p", str(ssh_port), f"root@{ssh_ip}", "echo ok"],
+            capture_output=True,
+        )
+        if r.returncode == 0:
+            print(" ready.")
+            return
+        print(".", end="", flush=True)
+        time.sleep(10)
+    print("\nERROR: sshd never became ready.")
+    sys.exit(1)
+
+
+def _wait_for_sentinel(ssh_ip: str, ssh_port: int, sentinel_path: str,
+                       label: str = "setup", timeout_attempts: int = 60,
+                       poll_interval: int = 10) -> None:
+    """Poll via SSH until sentinel_path exists on the pod.
+
+    Uses short reconnecting SSH calls so a dropped connection just retries
+    rather than killing the wait. Default: 60 attempts × 10 s = 10 min.
+    For long evals pass timeout_attempts=360, poll_interval=30 (3 h).
+    """
+    import time
+    print(f"Waiting for {label} ", end="", flush=True)
+    for _ in range(timeout_attempts):
+        r = subprocess.run(
+            ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+             "-p", str(ssh_port), f"root@{ssh_ip}",
+             f"test -f {sentinel_path} && echo yes || echo no"],
+            capture_output=True, text=True,
+        )
+        if r.returncode == 0 and r.stdout.strip() == "yes":
+            print(" done.")
+            return
+        print(".", end="", flush=True)
+        time.sleep(poll_interval)
+    print(f"\nERROR: {label} sentinel never appeared.")
+    sys.exit(1)
+
+
+def _wait_for_eval_done_or_failed(
+    ssh_ip: str,
+    ssh_port: int,
+    nanochat_base: str,
+    tag: str,
+    timeout_attempts: int = 360,
+    poll_interval: int = 30,
+) -> bool:
+    """Wait for one eval tag to finish, returning False when it failed remotely."""
+    import time
+
+    done_path = f"{nanochat_base}/DONE_{tag}"
+    failed_path = f"{nanochat_base}/FAILED_{tag}"
+    print(f"Waiting for {tag} eval (polls every {poll_interval} s, up to {timeout_attempts * poll_interval // 60} min) ", end="", flush=True)
+    for _ in range(timeout_attempts):
+        r = subprocess.run(
+            ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+             "-p", str(ssh_port), f"root@{ssh_ip}",
+             f"if [ -f {done_path} ]; then echo done; elif [ -f {failed_path} ]; then echo failed; else echo running; fi"],
+            capture_output=True, text=True,
+        )
+        status = r.stdout.strip() if r.returncode == 0 else "running"
+        if status == "done":
+            print(" done.")
+            return True
+        if status == "failed":
+            print(" failed.")
+            return False
+        print(".", end="", flush=True)
+        time.sleep(poll_interval)
+    print(f"\nERROR: {tag} eval did not finish before timeout.")
+    return False
+
+
+def _download_eval_results(ssh_ip: str, ssh_port: int, ssh_e: str, remote: str,
+                           nanochat_base: str, model_tags: list, results_dir: "Path",
+                           local_ckpt_base: "Path", have_tokenizer: bool) -> None:
+    """rsync eval CSVs, logs, and (optionally) tokenizer from pod to local disk."""
+    print("\nDownloading results …")
+    subprocess.run([
+        "rsync", "-av", "--progress", "-e", ssh_e,
+        f"{remote}:{nanochat_base}/base_eval/", str(results_dir) + "/",
+    ])
+    for tag in model_tags:
+        subprocess.run([
+            "rsync", "-av", "-e", ssh_e,
+            f"{remote}:{nanochat_base}/{tag}_eval.log", str(results_dir) + "/",
+        ])
+    print(f"\nResults saved to: {results_dir}/")
+    for csv_file in sorted(results_dir.glob("*.csv")):
+        print(f"\n--- {csv_file.name} ---")
+        print(csv_file.read_text())
+
+    if not have_tokenizer:
+        print("\nDownloading tokenizer …")
+        tok_dest = local_ckpt_base / "tokenizer"
+        r = subprocess.run([
+            "rsync", "-av", "--partial", "--progress", "-e", ssh_e,
+            f"{remote}:{nanochat_base}/tokenizer/", str(tok_dest) + "/",
+        ])
+        if r.returncode in (0, 23):
+            print(f"  Tokenizer saved to: {tok_dest}/")
+        else:
+            print(f"  WARNING: tokenizer download exited {r.returncode} (non-fatal)")
+
+
+def cmd_eval(args):
+    """
+    Launch a cheap eval pod, rsync local checkpoints up, run CORE+BPB on each
+    model tag, download result CSVs, terminate pod.
+    """
+    import time
+
+    get_api_key()
+
+    model_tags = [t.strip() for t in args.model_tags.split(",")]
+    # LOCAL_DEST already points to the directory that contains model-tag subdirs.
+    # (The download command rsyncs pod's base_checkpoints/ directly into LOCAL_DEST/.)
+    local_ckpt_base = Path(LOCAL_DEST)
+    nanochat_base = "/root/.cache/nanochat"
+
+    # Verify all requested checkpoints exist locally before spending money.
+    missing = []
+    for tag in model_tags:
+        ckpt_dir = local_ckpt_base / tag
+        if not ckpt_dir.exists() or not list(ckpt_dir.glob("model_*.pt")):
+            missing.append(str(ckpt_dir))
+    if missing:
+        print("ERROR: The following checkpoint directories are missing or empty:")
+        for m in missing:
+            print(f"  {m}")
+        print("Run 'python scripts/runpod_launch.py download <pod_id>' first.")
+        sys.exit(1)
+
+    # Check if we have the tokenizer locally (downloaded by an updated cmd_download).
+    local_tokenizer = local_ckpt_base / "tokenizer"
+    have_tokenizer = (local_tokenizer / "tokenizer.pkl").exists()
+    if have_tokenizer:
+        print("Local tokenizer found — will upload to pod (saves ~5 min setup).")
+    else:
+        print("No local tokenizer — pod will build it from ClimbMix (~5–8 min extra).")
+
+    startup = _make_eval_startup(nanochat_base, upload_tokenizer=have_tokenizer)
+
+    if args.dry_run:
+        print("=== Eval pod startup script (dry-run) ===")
+        print(" && \\\n".join(startup))
+        return
+
+    secure = getattr(args, "secure", False)
+    preferred_gpu = args.gpu
+    candidates = [preferred_gpu] if preferred_gpu else EVAL_GPU_PREFERENCE
+    gpu_type, pod = None, None
+    # Disk budget: repo+venv ~4GB, ClimbMix 30 shards ~12GB, tokenizer ~50MB,
+    # 2× final checkpoint (756MB each) + meta = ~2GB. 30GB with headroom.
+    print("Finding available GPU …")
+    for gpu in candidates:
+        try:
+            p = _try_launch_pod("nanochat-eval", gpu, startup, volume_id=None,
+                                disk_gb=30, env_extra={}, secure=secure)
+            gpu_type, pod = gpu, p
+            print(f"  Selected: {gpu}")
+            break
+        except Exception as e:
+            print(f"  {gpu}: {e}")
+    if pod is None:
+        print("ERROR: No eval GPU available.")
+        sys.exit(1)
+
+    pod_id = pod["id"]
+    print(f"\n  Pod ID  : {pod_id}")
+    print(f"  Console : https://www.runpod.io/console/pods/{pod_id}")
+
+    # Wait for SSH endpoint to appear.
+    print("\nWaiting for SSH endpoint ", end="", flush=True)
+    ssh_ip, ssh_port = None, None
+    for _ in range(60):
+        try:
+            pod = runpod.get_pod(pod_id)
+        except Exception:
+            time.sleep(10)
+            continue
+        ports = (pod.get("runtime") or {}).get("ports") or []
+        p22 = next((p for p in ports if p.get("privatePort") == 22), None)
+        if p22:
+            ssh_ip, ssh_port = p22["ip"], p22["publicPort"]
+            print(f" {ssh_ip}:{ssh_port}")
+            break
+        print(".", end="", flush=True)
+        time.sleep(10)
+    if not ssh_ip:
+        print("\nERROR: SSH port never appeared.")
+        runpod.terminate_pod(pod_id)
+        sys.exit(1)
+
+    _wait_for_ssh(ssh_ip, ssh_port)
+    _wait_for_sentinel(ssh_ip, ssh_port,
+                       f"{nanochat_base}/READY_FOR_EVAL", "env setup")
+
+    ssh_e = f"ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 -p {ssh_port}"
+    remote = f"root@{ssh_ip}"
+
+    # Upload tokenizer if available locally.
+    if have_tokenizer:
+        print("\nUploading tokenizer …")
+        r = subprocess.run([
+            "rsync", "-av", "--partial", "-e", ssh_e,
+            str(local_tokenizer) + "/",
+            f"{remote}:{nanochat_base}/tokenizer/",
+        ])
+        if r.returncode != 0:
+            print("ERROR: tokenizer rsync failed.")
+            runpod.terminate_pod(pod_id)
+            sys.exit(1)
+        print("  tokenizer: uploaded.")
+
+    # Upload only the final checkpoint for each model tag (eval doesn't need intermediates).
+    print("\nUploading checkpoints (final step only) …")
+    for tag in model_tags:
+        ckpt_dir = local_ckpt_base / tag
+        # Find the highest-numbered model_*.pt
+        pts = sorted(ckpt_dir.glob("model_*.pt"))
+        metas = sorted(ckpt_dir.glob("meta_*.json"))
+        if not pts:
+            print(f"ERROR: no model_*.pt found in {ckpt_dir}")
+            runpod.terminate_pod(pod_id)
+            sys.exit(1)
+        final_pt   = pts[-1]
+        final_meta = metas[-1] if metas else None
+
+        dst_dir = f"{remote}:{nanochat_base}/base_checkpoints/{tag}/"
+        subprocess.run(["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                        "-p", str(ssh_port), remote, f"mkdir -p {nanochat_base}/base_checkpoints/{tag}"],
+                       check=True)
+        for f in ([final_pt] + ([final_meta] if final_meta else [])):
+            r = subprocess.run(["rsync", "-av", "--partial", "--progress",
+                                "-e", ssh_e, str(f), dst_dir])
+            if r.returncode != 0:
+                print(f"ERROR: rsync of {f.name} failed.")
+                runpod.terminate_pod(pod_id)
+                sys.exit(1)
+        print(f"  {tag}: {final_pt.name} uploaded.")
+
+    # Smoke check: quick BPB on first model to verify checkpoint + tokenizer load correctly.
+    smoke_tag = model_tags[0]
+    print(f"\nSmoke check: loading {smoke_tag} …")
+    smoke_cmd = (
+        f"export NANOCHAT_BASE_DIR={nanochat_base} && "
+        f"cd ~/nanokan && "
+        f".venv/bin/python -m scripts.base_eval --model-tag {smoke_tag} "
+        f"--eval bpb --device-batch-size=4 --split-tokens=524288 2>&1 | tail -6"
+    )
+    r = subprocess.run(
+        ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=60",
+         "-p", str(ssh_port), remote, smoke_cmd],
+        timeout=300,
+    )
+    if r.returncode != 0:
+        print(f"\nERROR: smoke check failed (exit {r.returncode}). Pod left running for debug.")
+        print(f"SSH: ssh -p {ssh_port} root@{ssh_ip}")
+        sys.exit(1)
+    print("Smoke check passed.\n")
+
+    results_dir = Path(LOCAL_DEST) / "base_eval"
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write a shell script to the pod and launch it as a nohup background job.
+    # This decouples the eval from the local SSH session — if the laptop sleeps or
+    # the network drops, the eval keeps running on the pod. We then poll for
+    # DONE_{tag} sentinels with short reconnecting SSH calls.
+    eval_lines = [
+        "#!/bin/bash",
+        f"export NANOCHAT_BASE_DIR={nanochat_base}",
+        "cd ~/nanokan",
+        f"mkdir -p {nanochat_base}/base_eval",
+    ]
+    for tag in model_tags:
+        eval_lines += [
+            f"if .venv/bin/python -m scripts.base_eval --model-tag {tag} "
+            f"--eval core,bpb --device-batch-size=16 "
+            f">{nanochat_base}/{tag}_eval.log 2>&1; then",
+            f"  csv=$(ls -t {nanochat_base}/base_eval/base_model_*.csv 2>/dev/null | head -1)",
+            f"  if [ -n \"$csv\" ]; then mv \"$csv\" \"{nanochat_base}/base_eval/{tag}_$(basename \"$csv\")\"; fi",
+            f"  touch {nanochat_base}/DONE_{tag}",
+            "else",
+            f"  touch {nanochat_base}/FAILED_{tag}",
+            "fi",
+        ]
+    eval_script = "\n".join(eval_lines) + "\n"
+
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False) as tf:
+        tf.write(eval_script)
+        local_script = tf.name
+
+    subprocess.run(
+        ["scp", "-P", str(ssh_port), "-o", "StrictHostKeyChecking=no",
+         local_script, f"{remote}:/root/run_eval.sh"],
+        check=True,
+    )
+    # Save pod connection info BEFORE launching so eval-download can recover
+    # even if the nohup launch SSH call times out.
+    import json as _json
+    pod_info = {
+        "pod_id": pod_id, "ssh_ip": ssh_ip, "ssh_port": ssh_port,
+        "nanochat_base": nanochat_base, "model_tags": model_tags,
+        "have_tokenizer": have_tokenizer,
+    }
+    pod_info_path = results_dir / "running_pod.json"
+    pod_info_path.write_text(_json.dumps(pod_info, indent=2))
+    print(f"Pod info saved → {pod_info_path}")
+    print(f"If this script is interrupted, recover with:")
+    print(f"  python scripts/runpod_launch.py eval-download {pod_id}\n")
+
+    subprocess.run(
+        ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=60",
+         "-p", str(ssh_port), remote,
+         "chmod +x /root/run_eval.sh && nohup /root/run_eval.sh >/root/run_eval_nohup.out 2>&1 &"],
+        timeout=120, check=True,
+    )
+    print("Eval jobs launched as nohup background process on pod.")
+    print(f"If this script is interrupted, recover with:")
+    print(f"  python scripts/runpod_launch.py eval-download {pod_id}\n")
+
+    # Poll for DONE_{tag} sentinels — each call is a short SSH connection,
+    # so brief network blips won't abort the wait.
+    eval_ok = True
+    for tag in model_tags:
+        eval_ok = _wait_for_eval_done_or_failed(ssh_ip, ssh_port, nanochat_base, tag) and eval_ok
+
+    _download_eval_results(ssh_ip, ssh_port, ssh_e, remote, nanochat_base,
+                           model_tags, results_dir, local_ckpt_base, have_tokenizer)
+
+    pod_info_path.unlink(missing_ok=True)
+    print("\nTerminating pod …")
+    runpod.terminate_pod(pod_id)
+    print(f"Pod {pod_id} terminated.")
+    if not eval_ok:
+        print("ERROR: One or more eval jobs failed. Check downloaded *_eval.log files.")
+        sys.exit(1)
+
+
+# ── Subcommand: eval-download ─────────────────────────────────────────────────
+
+def cmd_eval_download(args):
+    """
+    Resume/recover an eval that was launched by 'eval' but whose local script died
+    (laptop slept, SSH dropped, etc.). The eval jobs keep running on the pod.
+
+    Reads pod connection info from checkpoints/nanochat/base_eval/running_pod.json
+    (written by 'eval') or accepts explicit --ssh HOST:PORT override.
+    """
+    import json as _json, time
+
+    get_api_key()
+
+    results_dir = Path(LOCAL_DEST) / "base_eval"
+    local_ckpt_base = Path(LOCAL_DEST)
+    pod_info_path = results_dir / "running_pod.json"
+
+    if pod_info_path.exists():
+        info = _json.loads(pod_info_path.read_text())
+        pod_id       = args.pod_id or info["pod_id"]
+        nanochat_base = info["nanochat_base"]
+        model_tags    = info["model_tags"]
+        have_tokenizer = info.get("have_tokenizer", False)
+    else:
+        if not args.pod_id:
+            print("ERROR: No running_pod.json found and no pod_id given.")
+            print(f"  Expected: {pod_info_path}")
+            sys.exit(1)
+        pod_id = args.pod_id
+        nanochat_base = "/root/.cache/nanochat"
+        model_tags = [t.strip() for t in (args.model_tags or "d12-grkan,d12-mlp").split(",")]
+        have_tokenizer = False
+
+    # Re-resolve SSH endpoint from RunPod API (IP/port can change after restart).
+    print(f"Resolving SSH endpoint for pod {pod_id} …")
+    ssh_ip, ssh_port = None, None
+    if args.ssh:
+        host, port = args.ssh.rsplit(":", 1)
+        ssh_ip, ssh_port = host, int(port)
+    else:
+        for _ in range(24):
+            try:
+                pod = runpod.get_pod(pod_id)
+            except Exception:
+                time.sleep(10)
+                continue
+            ports = (pod.get("runtime") or {}).get("ports") or []
+            p22 = next((p for p in ports if p.get("privatePort") == 22), None)
+            if p22:
+                ssh_ip, ssh_port = p22["ip"], p22["publicPort"]
+                break
+            print(".", end="", flush=True)
+            time.sleep(10)
+
+    if not ssh_ip:
+        print("\nERROR: Could not resolve SSH endpoint. Is the pod still running?")
+        print(f"  Check: https://www.runpod.io/console/pods/{pod_id}")
+        sys.exit(1)
+
+    print(f"  SSH: {ssh_ip}:{ssh_port}")
+    _wait_for_ssh(ssh_ip, ssh_port)
+
+    ssh_e = f"ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 -p {ssh_port}"
+    remote = f"root@{ssh_ip}"
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    # Wait for any still-running models.
+    eval_ok = True
+    for tag in model_tags:
+        done_path = f"{nanochat_base}/DONE_{tag}"
+        failed_path = f"{nanochat_base}/FAILED_{tag}"
+        r = subprocess.run(
+            ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+             "-p", str(ssh_port), remote,
+             f"if [ -f {done_path} ]; then echo done; elif [ -f {failed_path} ]; then echo failed; else echo running; fi"],
+            capture_output=True, text=True,
+        )
+        status = r.stdout.strip() if r.returncode == 0 else "running"
+        if status == "done":
+            print(f"  {tag}: already done.")
+        elif status == "failed":
+            print(f"  {tag}: failed.")
+            eval_ok = False
+        else:
+            print(f"  {tag}: still running — waiting (polls every 30 s, up to 3 h) …")
+            eval_ok = _wait_for_eval_done_or_failed(ssh_ip, ssh_port, nanochat_base, tag) and eval_ok
+
+    _download_eval_results(ssh_ip, ssh_port, ssh_e, remote, nanochat_base,
+                           model_tags, results_dir, local_ckpt_base, have_tokenizer)
+
+    pod_info_path.unlink(missing_ok=True)
+    print("\nTerminating pod …")
+    runpod.terminate_pod(pod_id)
+    print(f"Pod {pod_id} terminated.")
+    if not eval_ok:
+        print("ERROR: One or more eval jobs failed. Check downloaded *_eval.log files.")
+        sys.exit(1)
 
 
 # ── Subcommand: watch ─────────────────────────────────────────────────────────
@@ -862,7 +1421,7 @@ def cmd_watch(args):
 
     # Sentinel written by startup script after training finishes.
     # Model tag unknown here (could be d12-mlp or d12-grkan), so check either.
-    check_cmd = "ls ~/nanochat_results/DONE_* 2>/dev/null && echo done || echo running"
+    check_cmd = "if ls ~/nanochat_results/FAILED_* >/dev/null 2>&1; then echo failed; elif ls ~/nanochat_results/DONE_* >/dev/null 2>&1; then echo done; else echo running; fi"
     ssh_opt = f"ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -p {ssh_port}"
     ssh_failures = 0
     log_line_offset = 1  # next unread line in the remote training log (1-indexed)
@@ -898,6 +1457,16 @@ def cmd_watch(args):
                 print(f"  {line}")
 
         status = r.stdout.strip().splitlines()[-1]
+        if status == "failed":
+            print(f"[{time.strftime('%H:%M')}] Training failed on the pod. Starting download of logs/checkpoints …\n")
+            class _Args:
+                pass
+
+            dl_args = _Args()
+            dl_args.pod_id = pod_id
+            dl_args.dest = str(dest)
+            cmd_download(dl_args)
+            sys.exit(1)
         if status == "done":
             print(f"[{time.strftime('%H:%M')}] Training finished! Starting download …\n")
 
@@ -976,6 +1545,8 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Persistent volume ID. Strongly recommended for community cloud.")
     p_train.add_argument("--smoke", action="store_true",
                          help="Smoke-test mode: 10 steps, save-every=10, verify pipeline then stop.")
+    p_train.add_argument("--num-iterations", dest="num_iterations", type=int, default=None,
+                         help="Override total training steps (default: auto from param-data ratio).")
     p_train.add_argument("--save-every", dest="save_every", type=int, default=None,
                          help="Override save-every (checkpoints per N steps). Overrides smoke default.")
     p_train.add_argument("--secure", action="store_true",
@@ -995,6 +1566,26 @@ def build_parser() -> argparse.ArgumentParser:
     p_watch.add_argument("--interval", type=int, default=5,
                          help="Polling interval in minutes (default: 5)")
 
+    p_eval = sub.add_parser("eval", help="Run CORE+BPB eval on local checkpoints via a pod")
+    p_eval.add_argument("--model-tags", dest="model_tags", default="d12-grkan,d12-mlp",
+                        help="Comma-separated model tags to evaluate (default: d12-grkan,d12-mlp)")
+    p_eval.add_argument("--gpu", default=None, help="Force a specific GPU type (default: cheapest available)")
+    p_eval.add_argument("--secure", action="store_true",
+                        help="Use secure cloud (guaranteed availability, costs more)")
+    p_eval.add_argument("--dry-run", action="store_true",
+                        help="Print startup script without launching")
+
+    p_evdl = sub.add_parser(
+        "eval-download",
+        help="Recover a running eval: wait for completion, download results, terminate pod",
+    )
+    p_evdl.add_argument("pod_id", nargs="?", default=None,
+                        help="Pod ID (optional if running_pod.json exists)")
+    p_evdl.add_argument("--ssh", default=None, metavar="HOST:PORT",
+                        help="Override SSH endpoint (e.g. 1.2.3.4:12345)")
+    p_evdl.add_argument("--model-tags", dest="model_tags", default=None,
+                        help="Comma-separated model tags (only needed without running_pod.json)")
+
     return parser
 
 
@@ -1012,6 +1603,8 @@ def main():
         "train": cmd_train,
         "download": cmd_download,
         "watch": cmd_watch,
+        "eval": cmd_eval,
+        "eval-download": cmd_eval_download,
     }
     dispatch[args.command](args)
 
