@@ -458,9 +458,8 @@ def _make_train_startup(
         save_every = 10
     else:
         save_every = SAVE_EVERY
-# device_batch_size=32 needs >=50 GB VRAM (H100/A100). 16 is safe for 24-32 GB GPUs.
-# Grad accum auto-adjusts to maintain total_batch_size.
-device_batch_size = 16
+    # device_batch_size=32 needs >=50 GB VRAM (H100/A100).
+    device_batch_size = 32
     if smoke:
         extra_flags = " --num-iterations=10"
     elif num_iterations is not None:
