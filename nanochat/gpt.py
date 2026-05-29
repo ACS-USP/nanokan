@@ -70,7 +70,7 @@ class GroupRational(nn.Module):
     Group-Rational activation for GR-KAN (Yang & Wang, ICLR 2025).
 
     Applies g learnable Safe Padé rational functions to groups of input channels:
-        F(x) = (a₀ + a₁x + … + aₘxᵐ) / (1 + |b₁x + … + bₙxⁿ|)
+        F(x) = (a₀ + a₁x + … + aₘxᵐ) / (1 + |b₀x + b₁x² + … + b_{n-1}xⁿ|)
 
     Numerator coefficients a are shared across all groups; denominator b is per-group.
     Uses rational_kat_cu fused kernel when available; falls back to PyTorch Horner.
