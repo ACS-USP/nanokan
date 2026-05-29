@@ -52,6 +52,8 @@ class GPTConfig:
     grkan_groups: int = 8   # number of rational function groups (must divide n_embd and 4*n_embd)
     grkan_m: int = 5        # numerator polynomial degree
     grkan_n: int = 4        # denominator polynomial degree
+    grkan_init_rat1: str = "identity"  # init mode for first rational activation (pre-gate)
+    grkan_init_rat2: str = "swish"     # init mode for second rational activation (post-up-projection)
 
 
 def norm(x):
@@ -129,21 +131,24 @@ class GroupRational(nn.Module):
 
 class GRKANFFN(nn.Module):
     """
-    Group-Rational KAN FFN: replaces relu^2 MLP with rational activations before each projection.
-
         rat1(x) → c_fc → rat2(h) → c_proj
 
     rat1 is initialized to identity (pre-gate before up-projection).
     rat2 is initialized to approximate Swish (matches the relu^2 role).
     Parameter overhead over MLP: 2 × [(m+1) + g*n] = 76 params per block — negligible.
+
+    NOTE: This differs from the canonical KAT paper (Yang & Wang, ICLR 2025), which
+    uses GR-KAN as a drop-in activation replacement (proj → GR-KAN → proj). Here we
+    apply rational activations *before* each projection (GR-KAN → proj → GR-KAN → proj).
+    This is intentional — rat1 acts as a pre-gate, rat2 as a post-up-projection nonlinearity.
     """
     def __init__(self, config):
         super().__init__()
         hidden = 4 * config.n_embd
         g, m, n = config.grkan_groups, config.grkan_m, config.grkan_n
-        self.rat1   = GroupRational(config.n_embd, g, m, n, init="identity")
+        self.rat1   = GroupRational(config.n_embd, g, m, n, init=config.grkan_init_rat1)
         self.c_fc   = Linear(config.n_embd, hidden, bias=False)
-        self.rat2   = GroupRational(hidden, g, m, n, init="swish")
+        self.rat2   = GroupRational(hidden, g, m, n, init=config.grkan_init_rat2)
         self.c_proj = Linear(hidden, config.n_embd, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -446,6 +451,18 @@ class GPT(nn.Module):
             effective_seq = t if window < 0 else min(window, t)
             attn_flops += 12 * h * q * effective_seq
         num_flops_per_token = 6 * (nparams - nparams_exclude) + attn_flops
+
+        # GR-KAN rational activation FLOPs (forward + backward)
+        # rat1: (m+n) multiply-adds per d_model element; rat2: (m+n) per 4*d_model element
+        # Forward: 2 * (m+n) FLOPs/element per pass. Backward: 4x. Total 6x.
+        # 2 activations * (m+n) op * n_layer * d_model * seq_len * 6 ≈ 2·9·12·768·2048·6 ≈ 2.0e9
+        # This is ~0.5-1% of total FLOPs for typical configurations.
+        if self.config.ffn_type == "grkan":
+            m, n = self.config.grkan_m, self.config.grkan_n
+            n_layer, d_model, seq = self.config.n_layer, self.config.n_embd, self.config.sequence_len
+            grkan_flops_per_token = 2 * (m + n) * n_layer * d_model * seq
+            num_flops_per_token += 6 * grkan_flops_per_token
+
         return num_flops_per_token
 
     def num_scaling_params(self):
@@ -465,17 +482,26 @@ class GPT(nn.Module):
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
-        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
+        # Separate GR-KAN coefficients from transformer matrices for scaling law analysis
+        grkan_coeffs = 0
+        if self.config.ffn_type == "grkan":
+            for block in self.transformer.h:
+                grkan_coeffs += sum(p.numel() for p in block.mlp.rat1.parameters())
+                grkan_coeffs += sum(p.numel() for p in block.mlp.rat2.parameters())
+        transformer_matrices -= grkan_coeffs
+        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel() + grkan_coeffs
         total = wte + value_embeds + lm_head + transformer_matrices + scalars
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
-        return {
+        result = {
             'wte': wte,
             'value_embeds': value_embeds,
             'lm_head': lm_head,
             'transformer_matrices': transformer_matrices,
+            'grkan_coeffs': grkan_coeffs,
             'scalars': scalars,
             'total': total,
         }
+        return result
 
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5):
         model_dim = self.config.n_embd

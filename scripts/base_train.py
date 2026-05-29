@@ -25,7 +25,7 @@ import wandb
 import torch
 import torch.distributed as dist
 
-from nanochat.gpt import GPT, GPTConfig, Linear
+from nanochat.gpt import GPT, GPTConfig, Linear, _RAT_CUDA_AVAILABLE
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
@@ -53,6 +53,7 @@ parser.add_argument("--head-dim", type=int, default=128, help="target head dimen
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 parser.add_argument("--ffn-type", type=str, default="mlp", choices=["mlp", "grkan"], help="FFN type: mlp (default, relu^2) or grkan (Group-Rational KAN)")
+parser.add_argument("--grkan-init", type=str, default="identity,swish", help="comma-separated init modes for rat1,rat2 (default: identity,swish)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -117,7 +118,11 @@ else:
         print0("WARNING: Recommend using --window-pattern L for full context attention without alternating sliding window patterns.")
     print0("!" * 80)
 
-# -----------------------------------------------------------------------------
+# GR-KAN rational kernel status
+if _RAT_CUDA_AVAILABLE:
+    print0("✓ rational_kat_cu available (Triton accelerated GR-KAN backward)")
+else:
+    print0("⚠ rational_kat_cu not installed — GR-KAN backward will be ~123x slower (pure PyTorch Horner fallback)")
 # Tokenizer will be useful for evaluation and also we need the vocab size to init the model
 tokenizer = get_tokenizer()
 token_bytes = get_token_bytes(device=device)
@@ -134,11 +139,13 @@ def build_model_meta(depth):
     base_dim = depth * args.aspect_ratio
     model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
     num_heads = model_dim // args.head_dim
+    grkan_inits = args.grkan_init.split(",")
     config = GPTConfig(
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
         ffn_type=args.ffn_type,
+        grkan_init_rat1=grkan_inits[0].strip(), grkan_init_rat2=grkan_inits[1].strip(),
     )
     with torch.device("meta"):
         model_meta = GPT(config)
