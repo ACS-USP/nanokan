@@ -113,7 +113,7 @@ except ImportError:
 
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-REPO_URL = "https://github.com/HCAI-USP/nanokan"
+REPO_URL = "https://github.com/ACS-USP/nanokan"
 BRANCH = "master"
 
 # CUDA 12.8 devel image: required for nvcc to compile rational_kat_cu.
