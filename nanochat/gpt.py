@@ -70,7 +70,7 @@ class Linear(nn.Linear):
 class GroupRational(nn.Module):
     """
     Group-Rational activation for GR-KAN (Yang & Wang, ICLR 2025).
-        F(x) = (a₀ + a₁x + … + aₘxᵐ) / (1 + |b₀|·|x| + |b₁|·|x|² + … + |b_{n-1}|·|x|ⁿ)
+        F(x) = (a₀ + a₁x + … + aₘxᵐ) / (1 + |b₀x + b₁x² + … + b_{n-1}xⁿ|)
     Applies g learnable Safe Padé rational functions to groups of input channels:
 
     Numerator coefficients a are shared across all groups; denominator b is per-group.
@@ -116,16 +116,15 @@ class GroupRational(nn.Module):
         x_flat = x.reshape(-1, self.d_in)
         if _RAT_CUDA_AVAILABLE and x.is_cuda:
             return _rat_cuda(x_flat, self.a, self.b).reshape(shape)
-        # Pure-PyTorch Horner fallback — matches Triton kernel: Q = 1 + Σ|b_i|·|x|^(i+1)
+        # Pure-PyTorch Horner fallback: Q(x) = 1 + |b₀x + b₁x² + …|
         x_g = x_flat.reshape(-1, self.g, self.d_g)
-        abs_x_g = x_g.abs()
         num = self.a[self.m]
         for i in range(self.m - 1, -1, -1):
             num = self.a[i] + x_g * num
-        d = self.b[:, -1].abs().view(1, self.g, 1)
+        d = self.b[:, -1].view(1, self.g, 1)
         for i in range(self.n - 2, -1, -1):
-            d = self.b[:, i].abs().view(1, self.g, 1) + abs_x_g * d
-        denom = 1.0 + abs_x_g * d
+            d = self.b[:, i].view(1, self.g, 1) + x_g * d
+        denom = 1.0 + (x_g * d).abs()
         return (num / denom).reshape(shape)
 
 
