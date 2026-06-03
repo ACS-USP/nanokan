@@ -18,6 +18,7 @@ import json
 import time
 import math
 import argparse
+import sys
 from dataclasses import asdict
 from contextlib import contextmanager
 
@@ -54,6 +55,7 @@ parser.add_argument("--max-seq-len", type=int, default=2048, help="max context l
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 parser.add_argument("--ffn-type", type=str, default="mlp", choices=["mlp", "grkan"], help="FFN type: mlp (default, relu^2) or grkan (Group-Rational KAN)")
 parser.add_argument("--grkan-init", type=str, default="identity,swish", help="comma-separated init modes for rat1,rat2 (default: identity,swish)")
+parser.add_argument("--grkan-groups", type=int, default=8, help="number of GR-KAN rational groups")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -79,6 +81,11 @@ parser.add_argument("--sample-every", type=int, default=2000, help="sample from 
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
+parser.add_argument("--fail-fast", dest="fail_fast", action=argparse.BooleanOptionalAction, default=True, help="abort immediately on non-finite loss/validation/GR-KAN coefficients")
+parser.add_argument("--debug-finite-steps", type=int, default=100, help="number of initial steps with extra gradient/parameter finiteness checks")
+parser.add_argument("--max-loss", type=float, default=-1.0, help="optional raw training-loss ceiling; disabled when <=0")
+parser.add_argument("--max-runtime-minutes", type=float, default=-1.0, help="optional wall-clock budget; disabled when <=0")
+parser.add_argument("--debug-artifact-dir", type=str, default=None, help="directory for fail-fast diagnostic artifacts")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
@@ -145,6 +152,7 @@ def build_model_meta(depth):
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
         ffn_type=args.ffn_type,
+        grkan_groups=args.grkan_groups,
         grkan_init_rat1=grkan_inits[0].strip(), grkan_init_rat2=grkan_inits[1].strip(),
     )
     with torch.device("meta"):
@@ -421,6 +429,130 @@ print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_l
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 
+
+# Fail-fast guardrails. These checks deliberately live inside the training script
+# instead of only in the RunPod watcher: they still fire if SSH drops, tmux dies, or
+# the local monitor is not running.
+guard_artifact_dir = args.debug_artifact_dir or os.path.join(base_dir, "failure", output_dirname)
+guard_start_time = time.monotonic()
+
+def _any_rank_guard_failed(local_failed: bool) -> bool:
+    if not args.fail_fast:
+        return False
+    flag = torch.tensor([1 if local_failed else 0], device=device)
+    if is_ddp_initialized():
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+    return bool(flag.item())
+
+def _json_safe(obj):
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return str(obj)
+        return obj
+    if isinstance(obj, dict):
+        return {str(k): _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    return obj
+
+def _runtime_fingerprint():
+    try:
+        import importlib.metadata as importlib_metadata
+        rational_version = importlib_metadata.version("rational_kat_cu")
+    except Exception:
+        rational_version = "unknown"
+    cuda_name = torch.cuda.get_device_name(0) if device_type == "cuda" and torch.cuda.is_available() else None
+    return {
+        "python": sys.version,
+        "torch": torch.__version__,
+        "torch_cuda": torch.version.cuda,
+        "device_type": device_type,
+        "cuda_device": cuda_name,
+        "compute_dtype": str(COMPUTE_DTYPE),
+        "rational_kat_cu_available": _RAT_CUDA_AVAILABLE,
+        "rational_kat_cu_version": rational_version,
+        "model_tag": output_dirname,
+        "checkpoint_dir": checkpoint_dir,
+        "base_dir": base_dir,
+        "user_config": user_config,
+    }
+
+def _write_guard_failure(reason: str, step_value: int, micro_step: int | None = None, details: dict | None = None) -> None:
+    detail_fields = details or {}
+    micro = "" if micro_step is None else f" micro_step={micro_step}"
+    line = f"RUNPOD_GUARD_FAIL reason={reason} step={step_value}{micro} model_tag={output_dirname}"
+    print0(line, flush=True)
+    if master_process:
+        os.makedirs(guard_artifact_dir, exist_ok=True)
+        payload = {
+            "reason": reason,
+            "step": step_value,
+            "micro_step": micro_step,
+            "model_tag": output_dirname,
+            "details": _json_safe(detail_fields),
+            "checkpoint_dir": checkpoint_dir,
+            "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        with open(os.path.join(guard_artifact_dir, "failure.json"), "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, allow_nan=False)
+        with open(os.path.join(guard_artifact_dir, "runtime_fingerprint.json"), "w", encoding="utf-8") as f:
+            json.dump(_json_safe(_runtime_fingerprint()), f, indent=2, allow_nan=False)
+        with open(os.path.join(base_dir, f"FAILED_{output_dirname}"), "w", encoding="utf-8") as f:
+            f.write(reason + "\n")
+    raise RuntimeError(line)
+
+def _guard_tensor_finite(name: str, tensor: torch.Tensor, step_value: int, micro_step: int | None = None) -> None:
+    local_failed = not torch.isfinite(tensor.detach()).all().item()
+    if _any_rank_guard_failed(local_failed):
+        _write_guard_failure(f"nonfinite_{name}", step_value, micro_step, {"tensor": name})
+
+def _guard_float_finite(name: str, value: float | None, step_value: int) -> None:
+    if value is None:
+        return
+    local_failed = not math.isfinite(float(value))
+    if _any_rank_guard_failed(local_failed):
+        _write_guard_failure(f"nonfinite_{name}", step_value, details={name: value})
+
+def _guard_loss_ceiling(raw_loss: float, step_value: int) -> None:
+    if args.max_loss <= 0:
+        return
+    local_failed = raw_loss > args.max_loss
+    if _any_rank_guard_failed(local_failed):
+        _write_guard_failure("loss_ceiling_exceeded", step_value, details={"loss": raw_loss, "max_loss": args.max_loss})
+
+def _guard_runtime_budget(step_value: int) -> None:
+    if args.max_runtime_minutes <= 0:
+        return
+    elapsed_minutes = (time.monotonic() - guard_start_time) / 60
+    local_failed = elapsed_minutes > args.max_runtime_minutes
+    if _any_rank_guard_failed(local_failed):
+        _write_guard_failure("max_runtime_minutes_exceeded", step_value, details={"elapsed_minutes": elapsed_minutes, "max_runtime_minutes": args.max_runtime_minutes})
+
+def _iter_grkan_coefficients():
+    if args.ffn_type != "grkan":
+        return
+    for name, param in orig_model.named_parameters():
+        if ".rat" in name and (name.endswith(".a") or name.endswith(".b")):
+            yield name, param
+
+def _guard_grkan_coefficients(step_value: int, phase: str) -> None:
+    for name, param in _iter_grkan_coefficients() or ():
+        local_failed = not torch.isfinite(param.detach()).all().item()
+        if _any_rank_guard_failed(local_failed):
+            _write_guard_failure("nonfinite_grkan_coefficients", step_value, details={"parameter": name, "phase": phase})
+
+def _guard_selected_gradients(step_value: int) -> None:
+    for name, param in _iter_grkan_coefficients() or ():
+        if param.grad is None:
+            continue
+        local_failed = not torch.isfinite(param.grad.detach()).all().item()
+        if _any_rank_guard_failed(local_failed):
+            _write_guard_failure("nonfinite_grkan_gradient", step_value, details={"parameter": name})
+
+def _guard_checkpoint_state(step_value: int) -> None:
+    _guard_float_finite("val_bpb", val_bpb, step_value)
+    _guard_float_finite("smooth_train_loss", smooth_train_loss, step_value)
+    _guard_grkan_coefficients(step_value, "checkpoint")
 # Go!
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
@@ -434,6 +566,7 @@ while True:
         with disable_fp8(model):
             val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
+        _guard_float_finite("val_bpb", val_bpb, step)
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
         wandb_run.log({
@@ -484,6 +617,7 @@ while True:
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
     if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
+        _guard_checkpoint_state(step)
         save_checkpoint(
             checkpoint_dir,
             step,
@@ -518,6 +652,7 @@ while True:
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         loss = model(x, y)
+        _guard_tensor_finite("loss", loss, step, micro_step)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
@@ -525,6 +660,8 @@ while True:
         else:
             loss.backward()
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+    if step < args.debug_finite_steps:
+        _guard_selected_gradients(step)
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
@@ -546,11 +683,16 @@ while True:
         scaler.update()
     else:
         optimizer.step()
+    if step < args.debug_finite_steps:
+        _guard_grkan_coefficients(step, "post_optimizer")
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
+    _guard_float_finite("train_loss", train_loss_f, step)
+    _guard_loss_ceiling(train_loss_f, step)
     synchronize()
     t1 = time.time()
     dt = t1 - t0
+    _guard_runtime_budget(step)
     # -------------------------------------------------------------------------
 
     # logging (CPU action only)
@@ -573,7 +715,7 @@ while True:
     else:
         eta_str = ""
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | raw_loss: {train_loss_f:.6f} | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     if step % 100 == 0:
         log_data = {
             "step": step,
