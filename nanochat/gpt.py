@@ -117,13 +117,17 @@ class GroupRational(nn.Module):
         if _RAT_CUDA_AVAILABLE and x.is_cuda:
             return _rat_cuda(x_flat, self.a, self.b).reshape(shape)
         # Pure-PyTorch Horner fallback: Q(x) = 1 + |b₀x + b₁x² + …|
+        # Cast parameters to input dtype to avoid bfloat16→float32 promotion,
+        # which breaks Flash Attention 3 (requires bf16) in downstream blocks.
         x_g = x_flat.reshape(-1, self.g, self.d_g)
-        num = self.a[self.m]
+        a = self.a.to(dtype=x_g.dtype)
+        b = self.b.to(dtype=x_g.dtype)
+        num = a[self.m]
         for i in range(self.m - 1, -1, -1):
-            num = self.a[i] + x_g * num
-        d = self.b[:, -1].view(1, self.g, 1)
+            num = a[i] + x_g * num
+        d = b[:, -1].view(1, self.g, 1)
         for i in range(self.n - 2, -1, -1):
-            d = self.b[:, i].view(1, self.g, 1) + x_g * d
+            d = b[:, i].view(1, self.g, 1) + x_g * d
         denom = 1.0 + (x_g * d).abs()
         return (num / denom).reshape(shape)
 

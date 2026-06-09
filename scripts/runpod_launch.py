@@ -153,8 +153,10 @@ DOCKER_IMAGE = "nvidia/cuda:12.9.2-cudnn-devel-ubuntu22.04"
 # H100 only for corrected GR-KAN scale runs. Non-H100 options are preserved below
 # as commented fallback documentation, but are intentionally not active.
 GPU_PREFERENCE = [
+    "NVIDIA H100 80GB HBM3",          # H100 SXM — stock=High, US-NE-1
     "NVIDIA H100 PCIe",
-    "NVIDIA H100 80GB HBM3",
+    "NVIDIA A100-SXM4-80GB",          # 80 GB — valid for d12 per device_batch_size comment
+    "NVIDIA A100 80GB PCIe",          # 80 GB — valid for d12 per device_batch_size comment
     # "NVIDIA GeForce RTX 4090",        # 24 GB ~$0.34/hr — prior best-value d12 option
     # "NVIDIA RTX PRO 4500 Blackwell",  # 32 GB ~$0.34/hr — EU-RO-1 available
     # "NVIDIA RTX A6000",               # 48 GB ~$0.33/hr
@@ -475,7 +477,12 @@ def _base_startup(repo_ref: str | None = None, redact_secrets: bool = False) -> 
         # Install all dependencies using the project's lock + cu128 torch index.
         # `--extra gpu` selects the CUDA 12.8 build of torch from pyproject.toml.
         # Do NOT replace with `pip install torch` — that installs the CPU build.
-        "uv sync --extra gpu --quiet",
+        #
+        # The venv is stored on the network volume so subsequent pod launches skip
+        # the ~15-min download entirely: uv sync with an existing valid venv just
+        # verifies package versions in ~5s and exits.  The local .venv is a symlink.
+        "UV_PROJECT_ENVIRONMENT=/runpod-volume/nanochat/venv uv sync --extra gpu --quiet",
+        "ln -sfn /runpod-volume/nanochat/venv .venv",
     ]
 
     # Embed WANDB_API_KEY via base64 so it stays out of the RunPod env vars table.
@@ -538,8 +545,25 @@ def _make_train_startup(
 
     # Install rational_kat_cu from a pinned commit. Unpinned HEAD installs are
     # forbidden for science runs because the fused Triton math is part of the result.
-    cmds.append("uv pip install setuptools --quiet")
-    cmds.append(f"uv pip install git+https://github.com/felippe-alves/rational_kat_cu.git@{rational_ref} --quiet")
+    # Cached: only reinstalls if the pinned ref has changed (sentinel on volume).
+    # First install compiles Triton kernels (~5 min); subsequent launches are instant.
+    #
+    # NOTE: base64-encoded to avoid " and $(...) characters breaking the RunPod
+    # GraphQL mutation string literal that embeds the docker_args startup command.
+    rat_sentinel = "/runpod-volume/nanochat/rational_kat_cu_ref"
+    rat_install_script = (
+        # Sentinel guards against reinstall but we also verify the import succeeds:
+        # if the package is installed but its Triton compilation fails on a new pod
+        # (e.g. pod-local ~/.triton/cache is empty), we must reinstall rather than
+        # silently falling back to the slower PyTorch Horner path.
+        f'if [ ! -f {rat_sentinel} ] || [ "$(cat {rat_sentinel})" != "{rational_ref}" ] || ! python -c "from rational_kat_cu import rat_cuda" 2>/dev/null; then\n'
+        f'  uv pip install setuptools --quiet \\\n'
+        f'  && uv pip install git+https://github.com/felippe-alves/rational_kat_cu.git@{rational_ref} --quiet \\\n'
+        f'  && echo {rational_ref} > {rat_sentinel}\n'
+        f'fi\n'
+    )
+    encoded_rat = base64.b64encode(rat_install_script.encode()).decode()
+    cmds.append(f"echo {encoded_rat} | base64 -d > /tmp/install_rat.sh && bash /tmp/install_rat.sh")
 
     cmds += _dataset_and_tokenizer_startup(nanochat_base)
 
@@ -628,6 +652,17 @@ def _make_train_startup(
     encoded_train = base64.b64encode(train_script.encode()).decode()
     cmds.append(f"echo {encoded_train} | base64 -d > {train_script_path} && chmod +x {train_script_path}")
 
+    # If reusing a job dir (e.g. pilot → full run): archive the old log and remove
+    # any stale DONE/FAILED sentinels.  The supervise reads from line 1, so an old
+    # traceback at the end of the pilot log would trigger a false guard event; a
+    # stale FAILED sentinel would make it stop the pod immediately.
+    cmds.append(
+        f"[ -f {log_file} ] && mv {log_file} {log_file}.$(date -u +%Y%m%dT%H%M%SZ).bak || true"
+    )
+    cmds.append(
+        f"rm -f {nanochat_base}/DONE_* {nanochat_base}/FAILED_*"
+    )
+
     watchdog_cmd = (
         f".venv/bin/python scripts/train_watchdog.py"
         f" --model-tag={model_tag}"
@@ -708,9 +743,7 @@ def cmd_volume(args):
 
     if args.volume_action == "create":
         size = args.size
-        # EU-RO-1 has reliable RTX 4090 community availability.
-        # Pod and volume MUST be in the same datacenter — see DATACENTER_ID note.
-        DATACENTER_ID = "EU-RO-1"
+        DATACENTER_ID = getattr(args, "datacenter", None) or "EU-RO-1"
         mutation = f"""
         mutation {{
           createNetworkVolume(input: {{
@@ -733,7 +766,7 @@ def cmd_volume(args):
         print(f"\nFirst run:  python scripts/runpod_launch.py train --ffn-type mlp  --volume-id {vol_id}")
         print(f"Second run: python scripts/runpod_launch.py train --ffn-type grkan --volume-id {vol_id}")
         print()
-        print("NOTE: Pod must be launched in the same datacenter as the volume (EU-RO-1).")
+        print(f"NOTE: Pod must be launched in the same datacenter as the volume ({DATACENTER_ID}).")
         print("      The second run reuses the tokenizer and dataset shards from the volume,")
         print("      skipping the ~5 min setup step automatically.")
 
@@ -752,9 +785,7 @@ def cmd_volume(args):
     elif args.volume_action == "delete":
         mutation = f"""
         mutation {{
-          deleteNetworkVolume(input: {{ id: "{args.volume_id}" }}) {{
-            id
-          }}
+          deleteNetworkVolume(input: {{ id: "{args.volume_id}" }})
         }}
         """
         run_graphql_query(mutation)
@@ -971,7 +1002,7 @@ def _get_ssh_details(pod_id: str) -> tuple[str, int]:
 
     print("Getting SSH connection details ", end="", flush=True)
     ssh_port, ssh_ip = None, None
-    for _ in range(12):
+    for _ in range(24):  # 24 × 5s = 2 min; CUDA devel image needs >60s to expose SSH
         runtime = pod.get("runtime") or {}
         ports = runtime.get("ports") or []
         for p in ports:
@@ -1171,6 +1202,7 @@ def _wait_for_ssh(ssh_ip: str, ssh_port: int, timeout_attempts: int = 36) -> Non
     for _ in range(timeout_attempts):
         r = subprocess.run(
             ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5",
+             "-o", "BatchMode=yes",
              "-p", str(ssh_port), f"root@{ssh_ip}", "echo ok"],
             capture_output=True,
         )
@@ -1618,6 +1650,10 @@ def cmd_watch(args):
     """Poll the pod every N minutes; auto-download when training finishes."""
     import time
 
+    # Force line-buffered stdout so progress is visible even when output is
+    # redirected to a file (e.g. run_in_background=True in the Claude harness).
+    sys.stdout.reconfigure(line_buffering=True)
+
     get_api_key()
     pod_id = args.pod_id
     poll_minutes = args.interval
@@ -1677,6 +1713,7 @@ def cmd_watch(args):
     for _ in range(30):
         r = subprocess.run(
             ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5",
+             "-o", "BatchMode=yes",
              "-p", str(ssh_port), f"root@{ssh_ip}", "echo ok"],
             capture_output=True,
         )
@@ -1868,6 +1905,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_vc = vol_sub.add_parser("create", help="Create a new volume")
     p_vc.add_argument("--size", type=int, default=10,
                       help="Size in GB (default: 10; covers dataset + tokenizer + checkpoints)")
+    p_vc.add_argument("--datacenter", default="EU-RO-1",
+                      help="RunPod datacenter ID (default: EU-RO-1). Pod must be in same DC.")
     vol_sub.add_parser("ls", help="List volumes")
     p_vd = vol_sub.add_parser("delete", help="Delete a volume")
     p_vd.add_argument("volume_id")
