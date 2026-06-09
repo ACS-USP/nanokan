@@ -98,18 +98,19 @@ class GroupRational(nn.Module):
         if init == "identity":
             self.a.zero_()
             self.a[1] = 1.0
-            self.b.zero_()
         elif init == "swish":
-            # Fit numerator polynomial to Swish = x·σ(x) via least-squares (b stays 0).
+            # Fit numerator polynomial to Swish = x·σ(x) via least-squares.
             x_fit = torch.linspace(-4.0, 4.0, 2000)
             y_fit = x_fit * torch.sigmoid(x_fit)
             X = torch.stack([x_fit ** i for i in range(self.m + 1)], dim=1)
             a_fit = torch.linalg.lstsq(X, y_fit.unsqueeze(1)).solution.squeeze()
             self.a.copy_(a_fit[: self.m + 1])
-            self.b.zero_()
         else:
             nn.init.normal_(self.a, std=0.1)
-            self.b.zero_()
+        # b initialized to small non-zero values: b=0 → sign(b·x)=0 → zero gradient →
+        # b never updates. Small std=0.01 breaks the dead zone while keeping the
+        # rational function ≈1% above identity/swish at initialization.
+        nn.init.normal_(self.b, std=0.01)
 
     @torch.compiler.disable
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -512,9 +513,15 @@ class GPT(nn.Module):
         ddp, rank, local_rank, world_size = get_dist_info()
 
         # Separate out all parameters into groups
-        all_block_params  = list(self.transformer.h.parameters())
-        # Muon requires 2D+ matrices; 1D params (GroupRational.a coefficients) go to AdamW.
-        matrix_params     = [p for p in all_block_params if p.dim() >= 2]
+        # GroupRational.b must go to AdamW (not Muon): Muon's spectral orthogonalization
+        # is designed for weight matrices with learning signal. For b (polynomial coefficients
+        # initialized near-zero), Muon produces near-random large-norm updates that destabilize
+        # the rational function. AdamW's per-element adaptive LR is correct here.
+        all_block_named = list(self.transformer.h.named_parameters())
+        grkan_b_params = [p for n, p in all_block_named if '.rat' in n and n.endswith('.b')]
+        grkan_b_ids = {id(p) for p in grkan_b_params}
+        all_block_params = [p for _, p in all_block_named]
+        matrix_params = [p for p in all_block_params if p.dim() >= 2 and id(p) not in grkan_b_ids]
         scalar_block_params = [p for p in all_block_params if p.dim() < 2]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
@@ -522,7 +529,7 @@ class GPT(nn.Module):
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(scalar_block_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
+        assert len(list(self.parameters())) == len(matrix_params) + len(scalar_block_params) + len(grkan_b_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -541,6 +548,11 @@ class GPT(nn.Module):
         # 1D block params (GroupRational.a coefficients when ffn_type="grkan") → scalar AdamW
         if scalar_block_params:
             param_groups.append(dict(kind='adamw', params=scalar_block_params,
+                                     lr=scalar_lr * dmodel_lr_scale, betas=(0.8, 0.95),
+                                     eps=1e-10, weight_decay=0.0))
+        # GroupRational.b denominator coefficients → AdamW (not Muon, see comment above)
+        if grkan_b_params:
+            param_groups.append(dict(kind='adamw', params=grkan_b_params,
                                      lr=scalar_lr * dmodel_lr_scale, betas=(0.8, 0.95),
                                      eps=1e-10, weight_decay=0.0))
         # Muon groups (matrix params, grouped by shape for stacking)
