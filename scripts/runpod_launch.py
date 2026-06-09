@@ -1997,33 +1997,39 @@ def cmd_watch(args):
             return
 
         print(f"[{time.strftime('%H:%M')}] Still training. Polling for new checkpoints every 60 s …")
-        dest.mkdir(parents=True, exist_ok=True)
-        # Check every 60 s so new checkpoints arrive locally within ~1 min of being written,
-        # not after the full poll interval.  Status (done/failed) is rechecked after poll_minutes.
-        deadline = time.monotonic() + poll_minutes * 60
-        while time.monotonic() < deadline:
-            sync = subprocess.run(
-                [
-                    "rsync", "-a", "--ignore-existing", "--partial",
-                    "--include=*/",
-                    "--include=model_*.pt",
-                    "--include=optim_*_rank0.pt",
-                    "--include=meta_*.json",
-                    "--exclude=*",
-                    "-e", ssh_opt,
-                    f"root@{ssh_ip}:~/nanochat_results/base_checkpoints/",
-                    str(dest) + "/",
-                ],
-                capture_output=True, text=True,
-            )
-            new_ckpts = [l.strip() for l in sync.stdout.splitlines() if l.strip().endswith(".pt")]
-            if new_ckpts:
-                print(f"[{time.strftime('%H:%M')}]   Downloaded: {', '.join(new_ckpts)}")
-            elif sync.returncode not in (0, 23, 24):
-                print(f"[{time.strftime('%H:%M')}]   WARNING: rsync exited {sync.returncode}: {sync.stderr.strip()[:120]}")
-            remaining = deadline - time.monotonic()
-            if remaining > 0:
-                time.sleep(min(60, remaining))
+        if volume_backed:
+            # Checkpoints are on the network volume; no need to rsync them incrementally.
+            # A blocking rsync of large checkpoint files (model + optimizer > 2 GB) would
+            # prevent the DONE sentinel from being re-checked for 10+ minutes.  Just sleep.
+            time.sleep(poll_minutes * 60)
+        else:
+            dest.mkdir(parents=True, exist_ok=True)
+            # Check every 60 s so new checkpoints arrive locally within ~1 min of being written,
+            # not after the full poll interval.  Status (done/failed) is rechecked after poll_minutes.
+            deadline = time.monotonic() + poll_minutes * 60
+            while time.monotonic() < deadline:
+                sync = subprocess.run(
+                    [
+                        "rsync", "-a", "--ignore-existing", "--partial",
+                        "--include=*/",
+                        "--include=model_*.pt",
+                        "--include=optim_*_rank0.pt",
+                        "--include=meta_*.json",
+                        "--exclude=*",
+                        "-e", ssh_opt,
+                        f"root@{ssh_ip}:~/nanochat_results/base_checkpoints/",
+                        str(dest) + "/",
+                    ],
+                    capture_output=True, text=True,
+                )
+                new_ckpts = [l.strip() for l in sync.stdout.splitlines() if l.strip().endswith(".pt")]
+                if new_ckpts:
+                    print(f"[{time.strftime('%H:%M')}]   Downloaded: {', '.join(new_ckpts)}")
+                elif sync.returncode not in (0, 23, 24):
+                    print(f"[{time.strftime('%H:%M')}]   WARNING: rsync exited {sync.returncode}: {sync.stderr.strip()[:120]}")
+                remaining = deadline - time.monotonic()
+                if remaining > 0:
+                    time.sleep(min(60, remaining))
 
 
 
