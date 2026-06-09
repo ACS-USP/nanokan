@@ -255,10 +255,9 @@ def _try_launch_pod(
     disk_gb: int,
     env_extra: dict | None = None,
     secure: bool = False,
+    image_name: str | None = None,
 ) -> dict | None:
     import time
-
-    tok = get_github_token()
 
     cmd = " && ".join(startup)
     # Only PYTHONUNBUFFERED here — no secrets in the env dict.
@@ -272,7 +271,7 @@ def _try_launch_pod(
 
     kwargs = dict(
         name=name,
-        image_name=DOCKER_IMAGE,
+        image_name=image_name or DOCKER_IMAGE,
         gpu_type_id=gpu_type_id,
         cloud_type="SECURE" if secure else "COMMUNITY",
         container_disk_in_gb=disk_gb,
@@ -551,8 +550,12 @@ def _make_train_startup(
     # NOTE: base64-encoded to avoid " and $(...) characters breaking the RunPod
     # GraphQL mutation string literal that embeds the docker_args startup command.
     rat_sentinel = "/runpod-volume/nanochat/rational_kat_cu_ref"
+    # uv sync (earlier in startup) strips rational_kat_cu from the venv because
+    # it is not in pyproject.toml. Add an importability check so we reinstall
+    # whenever the package is missing, even when the version sentinel matches.
     rat_install_script = (
-        f'if [ ! -f {rat_sentinel} ] || [ "$(cat {rat_sentinel})" != "{rational_ref}" ]; then\n'
+        f'if [ ! -f {rat_sentinel} ] || [ "$(cat {rat_sentinel})" != "{rational_ref}" ] \\\n'
+        f'   || ! .venv/bin/python -c "import rational_kat_cu" 2>/dev/null; then\n'
         f'  uv pip install setuptools --quiet \\\n'
         f'  && uv pip install git+https://github.com/felippe-alves/rational_kat_cu.git@{rational_ref} --quiet \\\n'
         f'  && echo {rational_ref} > {rat_sentinel}\n'
@@ -681,6 +684,197 @@ def _make_train_startup(
         "runpodctl terminate pod $RUNPOD_POD_ID",
     ]
     return cmds
+
+
+# ── Subcommand: create-shell-template ────────────────────────────────────────
+
+SHELL_IMAGE = "ubuntu:22.04"
+SHELL_TEMPLATE_NAME = "nanochat-volume-shell"
+# Stored alongside .env so the team can share it.
+SHELL_TEMPLATE_ID_FILE = Path(__file__).resolve().parent.parent / ".runpod_shell_template_id"
+
+def _shell_startup_cmds(ssh_pubkey: str) -> list[str]:
+    """Startup commands for the shell pod.
+
+    Avoids $VAR references (GraphQL reserved) and single-quotes (break bash -c '...').
+    Uses base64-encoded key injection — same pattern as _base_startup().
+    """
+    b64key = base64.b64encode(ssh_pubkey.encode()).decode()
+    return [
+        "apt-get update -qq",
+        "apt-get install -y openssh-server rsync curl -qq",
+        "ssh-keygen -A",
+        "mkdir -p /root/.ssh && chmod 700 /root/.ssh",
+        f"echo {b64key} | base64 -d >> /root/.ssh/authorized_keys",
+        "chmod 600 /root/.ssh/authorized_keys",
+        "mkdir -p /etc/ssh/sshd_config.d",
+        "echo PermitRootLogin=yes > /etc/ssh/sshd_config.d/10-docker.conf",
+        "echo PubkeyAuthentication=yes >> /etc/ssh/sshd_config.d/10-docker.conf",
+        "echo StrictModes=no >> /etc/ssh/sshd_config.d/10-docker.conf",
+        "echo UsePAM=no >> /etc/ssh/sshd_config.d/10-docker.conf",
+        "mkdir -p /run/sshd",
+        "( /usr/sbin/sshd -D & ) && sleep 2",
+        "touch /root/SHELL_READY",
+        "sleep infinity",
+    ]
+
+
+def cmd_create_shell_template(_args):
+    from runpod.api.graphql import run_graphql_query
+
+    get_api_key()
+
+    # Upsert: include the existing ID if we already created this template before.
+    existing_id = SHELL_TEMPLATE_ID_FILE.read_text().strip() if SHELL_TEMPLATE_ID_FILE.exists() else ""
+    # Template stores a generic placeholder key; real key is embedded at pod-launch time.
+    # The template is used only to register the image+disk settings in the RunPod console.
+    placeholder_b64 = base64.b64encode(b"PLACEHOLDER_KEY").decode()
+    _template_cmds = [
+        "apt-get update -qq",
+        "apt-get install -y openssh-server rsync curl -qq",
+        "ssh-keygen -A",
+        "mkdir -p /root/.ssh && chmod 700 /root/.ssh",
+        f"echo {placeholder_b64} | base64 -d >> /root/.ssh/authorized_keys",
+        "chmod 600 /root/.ssh/authorized_keys",
+        "mkdir -p /etc/ssh/sshd_config.d",
+        "echo PermitRootLogin=yes > /etc/ssh/sshd_config.d/10-docker.conf",
+        "echo PubkeyAuthentication=yes >> /etc/ssh/sshd_config.d/10-docker.conf",
+        "echo StrictModes=no >> /etc/ssh/sshd_config.d/10-docker.conf",
+        "echo UsePAM=no >> /etc/ssh/sshd_config.d/10-docker.conf",
+        "mkdir -p /run/sshd",
+        "( /usr/sbin/sshd -D & ) && sleep 2",
+        "touch /root/SHELL_READY",
+        "sleep infinity",
+    ]
+    docker_cmd_escaped = " && ".join(_template_cmds).replace('"', '\\"')
+    id_field = f'id: "{existing_id}", ' if existing_id else ""
+    mutation = f"""
+    mutation {{
+        saveTemplate(input: {{
+            {id_field}
+            name: "{SHELL_TEMPLATE_NAME}",
+            imageName: "{SHELL_IMAGE}",
+            dockerArgs: "{docker_cmd_escaped}",
+            containerDiskInGb: 50,
+            volumeInGb: 0,
+            ports: "22/tcp",
+            env: [],
+            isServerless: false,
+            startSsh: true,
+            isPublic: false,
+            readme: ""
+        }}) {{ id name containerDiskInGb }}
+    }}
+    """
+    result = run_graphql_query(mutation)
+    tid = result["data"]["saveTemplate"]["id"]
+    SHELL_TEMPLATE_ID_FILE.write_text(tid + "\n")
+    action = "Updated" if existing_id else "Created"
+    print(f"Template {action.lower()} : {SHELL_TEMPLATE_NAME}")
+    print(f"Template ID      : {tid}")
+    print(f"Saved to         : {SHELL_TEMPLATE_ID_FILE}")
+    print(f"Console          : https://www.runpod.io/console/pods?templateId={tid}")
+    print()
+    print("Deploy via CLI:")
+    print(f"  python scripts/runpod_launch.py shell --volume-id <VOLUME_ID>")
+
+
+# ── Subcommand: shell ─────────────────────────────────────────────────────────
+
+def cmd_shell(args):
+    """Spin up a lightweight maintenance pod with a network volume mounted.
+
+    Without --cmd: waits for SSH, prints connection string, and blocks until
+    you press Ctrl-C (pod is stopped on exit).
+
+    With --cmd: runs the command over SSH, prints output, then stops the pod.
+    """
+    import time
+
+    get_api_key()
+
+    # Resolve template ID.
+    template_id = getattr(args, "template_id", None)
+    if not template_id and SHELL_TEMPLATE_ID_FILE.exists():
+        template_id = SHELL_TEMPLATE_ID_FILE.read_text().strip()
+    if not template_id:
+        print("No template ID found. Run first:")
+        print("  python scripts/runpod_launch.py create-shell-template")
+        sys.exit(1)
+
+    ssh_pubkey = _read_ssh_pubkey()
+
+    # H100 required — network volume xj62cpzdmv is only mountable on H100 datacenter nodes.
+    shell_gpu_preference = [
+        "NVIDIA H100 80GB HBM3",
+        "NVIDIA H100 PCIe",
+    ]
+    gpu_candidates = [args.gpu] if args.gpu else shell_gpu_preference
+
+    # Startup: embed the real SSH key at launch time (avoids $VAR in GraphQL).
+    startup_cmds = _shell_startup_cmds(ssh_pubkey)
+
+    pod = None
+    selected_gpu = None
+    print("Launching shell pod …")
+    for secure in (False, True):   # try community first, then secure cloud
+        for gpu in gpu_candidates:
+            try:
+                pod = _try_launch_pod(
+                    name="nanochat-shell",
+                    gpu_type_id=gpu,
+                    startup=startup_cmds,
+                    volume_id=args.volume_id,
+                    disk_gb=50,
+                    secure=secure,
+                    image_name=SHELL_IMAGE,
+                )
+                selected_gpu = f"{gpu} ({'secure' if secure else 'community'})"
+                break
+            except Exception as e:
+                print(f"  {gpu} ({'secure' if secure else 'community'}): {e}")
+                continue
+        if pod is not None:
+            break
+
+    if pod is None:
+        print("ERROR: could not launch shell pod on any GPU.")
+        sys.exit(1)
+
+    pod_id = pod["id"]
+    print(f"  Pod      : {pod_id}  ({selected_gpu})")
+    print(f"  Volume   : {args.volume_id} → {VOLUME_MOUNT}")
+    print(f"  Console  : https://www.runpod.io/console/pods/{pod_id}")
+
+    ssh_ip, ssh_port = _get_ssh_details(pod_id)
+    _wait_for_ssh(ssh_ip, ssh_port)
+    _wait_for_sentinel(ssh_ip, ssh_port, "/root/SHELL_READY", label="shell setup")
+
+    ssh_e = f"ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -p {ssh_port}"
+
+    if args.cmd:
+        print(f"\nRunning: {args.cmd}\n{'─' * 60}")
+        result = subprocess.run(
+            ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+             "-p", str(ssh_port), f"root@{ssh_ip}", args.cmd],
+            text=True,
+        )
+        print(f"{'─' * 60}\nExit code: {result.returncode}")
+        print(f"\nStopping pod {pod_id} …")
+        runpod.stop_pod(pod_id)
+        print("Done.")
+    else:
+        print(f"\nShell ready. Connect with:")
+        print(f"  ssh -o StrictHostKeyChecking=no -p {ssh_port} root@{ssh_ip}")
+        print(f"\nVolume is at: {VOLUME_MOUNT}")
+        print("Press Ctrl-C to stop the pod when finished.\n")
+        try:
+            while True:
+                time.sleep(30)
+        except KeyboardInterrupt:
+            print(f"\nStopping pod {pod_id} …")
+            runpod.stop_pod(pod_id)
+            print("Done.")
 
 
 # ── Subcommand: gpus ──────────────────────────────────────────────────────────
@@ -1765,7 +1959,11 @@ def cmd_watch(args):
                 if event and event.should_stop:
                     print(f"[{time.strftime('%H:%M')}] Guard event detected: {event.reason}.")
                     if manifest is not None:
-                        manifest.record_event(event.kind, reason=event.reason, line=event.line, **event.fields)
+                        # event.fields for guard_fail events contains "reason" (parsed from the
+                        # RUNPOD_GUARD_FAIL log line), so strip it before the ** expansion to
+                        # avoid "got multiple values for keyword argument 'reason'".
+                        extra = {k: v for k, v in event.fields.items() if k not in ("reason", "line")}
+                        manifest.record_event(event.kind, reason=event.reason, line=event.line, **extra)
                         manifest.save(manifest_path)
                     if not volume_backed:
                         print("  Pod-local artifacts: downloading failure evidence before stop.")
@@ -1798,26 +1996,34 @@ def cmd_watch(args):
             _save_manifest_state("downloaded", "DONE artifacts downloaded")
             return
 
-        print(f"[{time.strftime('%H:%M')}] Still training … syncing checkpoints …")
+        print(f"[{time.strftime('%H:%M')}] Still training. Polling for new checkpoints every 60 s …")
         dest.mkdir(parents=True, exist_ok=True)
-        sync = subprocess.run(
-            [
-                "rsync", "-a", "--ignore-existing", "--partial",
-                "--include=*/", "--include=model_*.pt", "--include=meta_*.json",
-                "--exclude=*",
-                "-e", ssh_opt,
-                f"root@{ssh_ip}:~/nanochat_results/base_checkpoints/",
-                str(dest) + "/",
-            ],
-            capture_output=True, text=True,
-        )
-        new_ckpts = [l.strip() for l in sync.stdout.splitlines() if l.strip().endswith(".pt")]
-        if new_ckpts:
-            print(f"  Downloaded: {', '.join(new_ckpts)}")
-        elif sync.returncode not in (0, 23, 24):
-            print(f"  WARNING: rsync exited {sync.returncode}: {sync.stderr.strip()[:120]}")
-        print(f"  Next check in {poll_minutes} min.")
-        time.sleep(poll_minutes * 60)
+        # Check every 60 s so new checkpoints arrive locally within ~1 min of being written,
+        # not after the full poll interval.  Status (done/failed) is rechecked after poll_minutes.
+        deadline = time.monotonic() + poll_minutes * 60
+        while time.monotonic() < deadline:
+            sync = subprocess.run(
+                [
+                    "rsync", "-a", "--ignore-existing", "--partial",
+                    "--include=*/",
+                    "--include=model_*.pt",
+                    "--include=optim_*_rank0.pt",
+                    "--include=meta_*.json",
+                    "--exclude=*",
+                    "-e", ssh_opt,
+                    f"root@{ssh_ip}:~/nanochat_results/base_checkpoints/",
+                    str(dest) + "/",
+                ],
+                capture_output=True, text=True,
+            )
+            new_ckpts = [l.strip() for l in sync.stdout.splitlines() if l.strip().endswith(".pt")]
+            if new_ckpts:
+                print(f"[{time.strftime('%H:%M')}]   Downloaded: {', '.join(new_ckpts)}")
+            elif sync.returncode not in (0, 23, 24):
+                print(f"[{time.strftime('%H:%M')}]   WARNING: rsync exited {sync.returncode}: {sync.stderr.strip()[:120]}")
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(60, remaining))
 
 
 
@@ -1887,6 +2093,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("gpus", help="List available GPU types and prices")
     sub.add_parser("ls", help="List running/stopped pods")
+
+    sub.add_parser("create-shell-template",
+                   help="Create (once) the reusable nanochat-volume-shell RunPod template")
+
+    p_shell = sub.add_parser("shell",
+                              help="Launch a lightweight maintenance pod with a volume mounted")
+    p_shell.add_argument("--volume-id", required=True, help="Network volume ID to mount")
+    p_shell.add_argument("--template-id", default=None,
+                         help="RunPod template ID (default: read from .runpod_shell_template_id)")
+    p_shell.add_argument("--gpu", default=None,
+                         help="Preferred GPU type (default: cheapest available)")
+    p_shell.add_argument("--cmd", default=None,
+                         help="Run this command over SSH then stop the pod")
 
     p_stop = sub.add_parser("stop", help="Stop a pod (preserves disk)")
     p_stop.add_argument("pod_id")
@@ -2031,6 +2250,8 @@ def main():
         "volume": cmd_volume,
         "test": cmd_test,
         "train": cmd_train,
+        "create-shell-template": cmd_create_shell_template,
+        "shell": cmd_shell,
         "download": cmd_download,
         "watch": cmd_watch,
         "supervise": cmd_supervise,
