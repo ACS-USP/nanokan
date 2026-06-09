@@ -552,11 +552,7 @@ def _make_train_startup(
     # GraphQL mutation string literal that embeds the docker_args startup command.
     rat_sentinel = "/runpod-volume/nanochat/rational_kat_cu_ref"
     rat_install_script = (
-        # Sentinel guards against reinstall but we also verify the import succeeds:
-        # if the package is installed but its Triton compilation fails on a new pod
-        # (e.g. pod-local ~/.triton/cache is empty), we must reinstall rather than
-        # silently falling back to the slower PyTorch Horner path.
-        f'if [ ! -f {rat_sentinel} ] || [ "$(cat {rat_sentinel})" != "{rational_ref}" ] || ! python -c "from rational_kat_cu import rat_cuda" 2>/dev/null; then\n'
+        f'if [ ! -f {rat_sentinel} ] || [ "$(cat {rat_sentinel})" != "{rational_ref}" ]; then\n'
         f'  uv pip install setuptools --quiet \\\n'
         f'  && uv pip install git+https://github.com/felippe-alves/rational_kat_cu.git@{rational_ref} --quiet \\\n'
         f'  && echo {rational_ref} > {rat_sentinel}\n'
