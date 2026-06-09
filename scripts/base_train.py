@@ -699,12 +699,14 @@ while True:
             for v in scaler._found_inf_per_device(optimizer).values():
                 dist.all_reduce(v, op=dist.ReduceOp.MAX)
         if args.max_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+            _adamw_params = [p for g in optimizer.param_groups if g.get('kind') != 'muon' for p in g['params'] if p.requires_grad]
+            torch.nn.utils.clip_grad_norm_(_adamw_params, args.max_grad_norm)
         scaler.step(optimizer)
         scaler.update()
     else:
         if args.max_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+            _adamw_params = [p for g in optimizer.param_groups if g.get('kind') != 'muon' for p in g['params'] if p.requires_grad]
+            torch.nn.utils.clip_grad_norm_(_adamw_params, args.max_grad_norm)
         optimizer.step()
     if step < args.debug_finite_steps:
         _guard_grkan_coefficients(step, "post_optimizer")
