@@ -35,6 +35,24 @@ from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
 from scripts.base_eval import evaluate_core
+
+# Capture full traceback to volume before watchdog can kill on first "Traceback" line.
+# sys.excepthook fires BEFORE any traceback lines appear on stderr, so by the time
+# the watchdog sees the first line and sends SIGTERM, the file is already written.
+_original_excepthook = sys.excepthook
+def _debug_excepthook(exc_type, exc_value, exc_tb):
+    import traceback
+    tb_text = ''.join(traceback.format_exception(exc_type, exc_value, exc_tb))
+    try:
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        crash_path = f"/runpod-volume/nanochat/debug_crash_rank{local_rank}.txt"
+        with open(crash_path, "w") as _f:
+            _f.write(tb_text)
+    except Exception:
+        pass
+    _original_excepthook(exc_type, exc_value, exc_tb)
+sys.excepthook = _debug_excepthook
+
 print_banner()
 
 # -----------------------------------------------------------------------------
