@@ -1,4 +1,6 @@
+import base64
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -10,6 +12,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts import runpod_launch
 from scripts import runpod_supervisor as supervisor
 from scripts import train_watchdog
+
+
+def _decoded_startup_payload(script: str, path_fragment: str) -> str:
+    pattern = rf"echo ([A-Za-z0-9+/=]+) \| base64 -d > {re.escape(path_fragment)}"
+    match = re.search(pattern, script)
+    assert match is not None
+    return base64.b64decode(match.group(1)).decode()
 
 
 def _manifest(**overrides):
@@ -98,7 +107,8 @@ def test_train_startup_is_pinned_failfast_and_job_scoped(monkeypatch):
         max_runtime_minutes=30,
     )
     script = "\n".join(startup)
-    assert "rational_kat_cu.git@41a20b5" in script
+    install_rat = _decoded_startup_payload(script, "/tmp/install_rat.sh")
+    assert "rational_kat_cu.git@41a20b5" in install_rat
     assert "git checkout abcdef123456" in script
     assert "/runpod-volume/nanochat/jobs/job123" in script
     assert "scripts/train_watchdog.py" in script
@@ -106,6 +116,103 @@ def test_train_startup_is_pinned_failfast_and_job_scoped(monkeypatch):
     assert "--debug-finite-steps=20" in script
     assert "--grkan-groups=16" in script
     assert "runpodctl stop pod $RUNPOD_POD_ID" in script
+
+
+def test_train_autosupervises_by_default(monkeypatch, tmp_path):
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
+    monkeypatch.setattr(runpod_launch, "get_api_key", lambda: "rp_test")
+    monkeypatch.setattr(runpod_launch, "_read_ssh_pubkey", lambda: "ssh-ed25519 AAAATEST")
+    monkeypatch.setattr(runpod_launch, "_local_source_hotfix", lambda: [])
+    monkeypatch.setattr(runpod_launch, "_local_git_ref", lambda: "abcdef123456")
+    monkeypatch.setattr(runpod_launch, "_dirty_patch_sha256", lambda: None)
+    monkeypatch.setattr(
+        runpod_launch,
+        "find_and_launch_pod",
+        lambda **_kwargs: ("NVIDIA H100 80GB HBM3", {"id": "pod_123", "costPerHr": 3.29}),
+    )
+
+    captured = {}
+
+    def fake_supervise(args):
+        captured["manifest"] = args.manifest
+        captured["terminate_on_done"] = args.terminate_on_done
+
+    monkeypatch.setattr(runpod_launch, "cmd_supervise", fake_supervise)
+
+    args = runpod_launch.build_parser().parse_args(
+        [
+            "train",
+            "--ffn-type",
+            "grkan",
+            "--grkan-groups",
+            "16",
+            "--num-iterations",
+            "500",
+            "--volume-id",
+            "vol_123",
+            "--gate-approved",
+            "--manifest-dir",
+            str(tmp_path),
+        ]
+    )
+    runpod_launch.cmd_train(args)
+
+    assert captured["terminate_on_done"] is True
+    manifest_path = Path(captured["manifest"])
+    assert manifest_path.exists()
+    payload = json.loads(manifest_path.read_text())
+    assert payload["pod_id"] == "pod_123"
+    assert payload["model_tag"] == "d12-grkan-g16"
+
+
+def test_train_detach_skips_autosupervise(monkeypatch, tmp_path):
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
+    monkeypatch.setattr(runpod_launch, "get_api_key", lambda: "rp_test")
+    monkeypatch.setattr(runpod_launch, "_read_ssh_pubkey", lambda: "ssh-ed25519 AAAATEST")
+    monkeypatch.setattr(runpod_launch, "_local_source_hotfix", lambda: [])
+    monkeypatch.setattr(runpod_launch, "_local_git_ref", lambda: "abcdef123456")
+    monkeypatch.setattr(runpod_launch, "_dirty_patch_sha256", lambda: None)
+    monkeypatch.setattr(
+        runpod_launch,
+        "find_and_launch_pod",
+        lambda **_kwargs: ("NVIDIA H100 80GB HBM3", {"id": "pod_123", "costPerHr": 3.29}),
+    )
+    monkeypatch.setattr(runpod_launch, "cmd_supervise", lambda _args: pytest.fail("unexpected supervise"))
+
+    args = runpod_launch.build_parser().parse_args(
+        [
+            "train",
+            "--ffn-type",
+            "grkan",
+            "--grkan-groups",
+            "16",
+            "--num-iterations",
+            "500",
+            "--volume-id",
+            "vol_123",
+            "--gate-approved",
+            "--manifest-dir",
+            str(tmp_path),
+            "--detach",
+        ]
+    )
+    runpod_launch.cmd_train(args)
+
+    manifests = list(tmp_path.glob("*.json"))
+    assert len(manifests) == 1
+
+
+def test_watch_and_supervise_terminate_by_default():
+    parser = runpod_launch.build_parser()
+    watch_args = parser.parse_args(["watch", "pod_123"])
+    supervise_args = parser.parse_args(["supervise", "--manifest", "manifest.json"])
+    keep_watch_args = parser.parse_args(["watch", "pod_123", "--keep-pod-on-done"])
+    keep_supervise_args = parser.parse_args(["supervise", "--manifest", "manifest.json", "--keep-pod-on-done"])
+
+    assert watch_args.terminate_on_done is True
+    assert supervise_args.terminate_on_done is True
+    assert keep_watch_args.terminate_on_done is False
+    assert keep_supervise_args.terminate_on_done is False
 
 
 def test_watchdog_writes_failure_bundle_on_nan(tmp_path):

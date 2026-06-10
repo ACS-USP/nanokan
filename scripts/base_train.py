@@ -101,7 +101,7 @@ parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 parser.add_argument("--fail-fast", dest="fail_fast", action=argparse.BooleanOptionalAction, default=True, help="abort immediately on non-finite loss/validation/GR-KAN coefficients")
 parser.add_argument("--debug-finite-steps", type=int, default=100, help="number of initial steps with extra gradient/parameter finiteness checks")
-parser.add_argument("--max-grad-norm", type=float, default=1.0, help="gradient norm clip threshold; 0 = disabled")
+parser.add_argument("--max-grad-norm", type=float, default=0.0, help="gradient norm clip threshold; 0 = disabled")
 parser.add_argument("--max-loss", type=float, default=-1.0, help="optional raw training-loss ceiling; disabled when <=0")
 parser.add_argument("--max-runtime-minutes", type=float, default=-1.0, help="optional wall-clock budget; disabled when <=0")
 parser.add_argument("--debug-artifact-dir", type=str, default=None, help="directory for fail-fast diagnostic artifacts")

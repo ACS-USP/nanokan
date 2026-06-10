@@ -98,6 +98,7 @@ class GroupRational(nn.Module):
         if init == "identity":
             self.a.zero_()
             self.a[1] = 1.0
+            self.b.zero_()
         elif init == "swish":
             # Fit numerator polynomial to Swish = x·σ(x) via least-squares.
             x_fit = torch.linspace(-4.0, 4.0, 2000)
@@ -105,12 +106,13 @@ class GroupRational(nn.Module):
             X = torch.stack([x_fit ** i for i in range(self.m + 1)], dim=1)
             a_fit = torch.linalg.lstsq(X, y_fit.unsqueeze(1)).solution.squeeze()
             self.a.copy_(a_fit[: self.m + 1])
+            # b=0 gives sign(b·x)=0 and therefore zero denominator gradients.
+            # Small noise keeps the Swish-like activation trainable without making
+            # the identity pre-gate distort the residual stream at initialization.
+            nn.init.normal_(self.b, std=0.01)
         else:
             nn.init.normal_(self.a, std=0.1)
-        # b initialized to small non-zero values: b=0 → sign(b·x)=0 → zero gradient →
-        # b never updates. Small std=0.01 breaks the dead zone while keeping the
-        # rational function ≈1% above identity/swish at initialization.
-        nn.init.normal_(self.b, std=0.01)
+            nn.init.normal_(self.b, std=0.01)
 
     @torch.compiler.disable
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -554,7 +556,7 @@ class GPT(nn.Module):
         if grkan_b_params:
             param_groups.append(dict(kind='adamw', params=grkan_b_params,
                                      lr=scalar_lr * dmodel_lr_scale, betas=(0.8, 0.95),
-                                     eps=1e-10, weight_decay=0.0))
+                                     eps=1e-10, weight_decay=0.1))
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]

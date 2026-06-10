@@ -43,6 +43,45 @@ For development (adds pytest, matplotlib, ipykernel, transformers, etc.):
 uv sync --extra gpu --group dev
 ```
 
+### Safe RunPod orchestration
+
+For GR-KAN RunPod campaigns, use the top-level orchestrator instead of launching
+pods directly. It runs the hardened launcher in a mandatory sequence:
+preflight `ls`, exact training smoke, first-save pilot, artifact verification,
+download, and pod termination. Full runs are refused until prior phases are
+verified locally.
+
+Preview the sequence without touching RunPod:
+
+```bash
+python scripts/runpod_orchestrate.py plan \
+  --models d12-grkan-g4,d12-grkan-g16 \
+  --repo-ref <nanokan_commit> \
+  --rational-kat-cu-ref <rational_kat_cu_commit> \
+  --volume-id <runpod_volume_id> \
+  --secure \
+  --until pilot
+```
+
+Run the supervised workflow:
+
+```bash
+python scripts/runpod_orchestrate.py run \
+  --models d12-grkan-g4,d12-grkan-g16 \
+  --repo-ref <nanokan_commit> \
+  --rational-kat-cu-ref <rational_kat_cu_commit> \
+  --volume-id <runpod_volume_id> \
+  --secure \
+  --until full
+```
+
+If the local process is interrupted, resume from the workflow manifest:
+
+```bash
+python scripts/runpod_orchestrate.py resume \
+  --manifest checkpoints/nanochat/orchestrator/<workflow_id>.json
+```
+
 ### Reproduce and talk to GPT-2
 
 The most fun you can have is to train your own GPT-2 and talk to it. The entire pipeline to do so is contained in the single file [runs/speedrun.sh](runs/speedrun.sh), which is designed to be run on an 8XH100 GPU node. Boot up a new 8XH100 GPU box from your favorite provider (e.g. I use and like [Lambda](https://lambda.ai/service/gpu-cloud)), and kick off the training script:

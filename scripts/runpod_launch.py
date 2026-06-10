@@ -1172,6 +1172,23 @@ def cmd_train(args):
     print(f"  python scripts/runpod_launch.py supervise --manifest {manifest_path}")
     print(f"Manual download while pod is RUNNING:")
     print(f"  python scripts/runpod_launch.py download {pod_id}")
+    if getattr(args, "detach", False):
+        print("\nDetached mode requested; this command will not supervise the pod.")
+        print("Run the supervise command above from a reliable terminal before launching anything else.")
+        return
+
+    print("\nAuto-supervising this manifest now. Use --detach only when another supervisor is already running.")
+
+    class _Args:
+        pass
+
+    supervise_args = _Args()
+    supervise_args.manifest = str(manifest_path)
+    supervise_args.dest = None
+    supervise_args.interval = 1
+    supervise_args.ssh_failure_limit = 6
+    supervise_args.terminate_on_done = True
+    cmd_supervise(supervise_args)
 
 
 # ── Subcommand: download ──────────────────────────────────────────────────────
@@ -1869,6 +1886,14 @@ def cmd_watch(args):
         dl_args.terminate = terminate
         cmd_download(dl_args)
 
+    def _stop_for_supervision_failure(reason: str) -> None:
+        print(f"\n{reason}")
+        _save_manifest_state("stopping", reason)
+        try:
+            runpod.stop_pod(pod_id)
+        finally:
+            _save_manifest_state("stopped", reason)
+
     print(f"Watching pod {pod_id}. Will auto-download when training finishes.")
     print(f"Polling every {poll_minutes} min. Keep this terminal open. Ctrl+C to cancel.")
     _save_manifest_state("ssh_wait", "watch started")
@@ -1894,7 +1919,7 @@ def cmd_watch(args):
         time.sleep(10)
 
     if not ssh_ip:
-        print("\nERROR: SSH port never appeared. Check the pod in the RunPod console.")
+        _stop_for_supervision_failure("SSH port never appeared")
         sys.exit(1)
 
     print(f"\nSSH endpoint: {ssh_ip}:{ssh_port}")
@@ -1913,7 +1938,7 @@ def cmd_watch(args):
         print(".", end="", flush=True)
         time.sleep(10)
     else:
-        print("\nERROR: sshd never became ready.")
+        _stop_for_supervision_failure("sshd never became ready")
         sys.exit(1)
 
     # Sentinel written by startup script after training finishes.
@@ -1993,7 +2018,10 @@ def cmd_watch(args):
             print(f"[{time.strftime('%H:%M')}] Training finished! Starting download …\n")
             _save_manifest_state("downloading", "DONE sentinel")
             _download_from_running(terminate=bool(getattr(args, "terminate_on_done", False)))
-            _save_manifest_state("downloaded", "DONE artifacts downloaded")
+            if bool(getattr(args, "terminate_on_done", False)):
+                _save_manifest_state("terminated", "DONE artifacts downloaded and pod terminated")
+            else:
+                _save_manifest_state("downloaded", "DONE artifacts downloaded")
             return
 
         print(f"[{time.strftime('%H:%M')}] Still training. Polling for new checkpoints every 60 s …")
@@ -2180,6 +2208,8 @@ def build_parser() -> argparse.ArgumentParser:
                          help="watchdog runtime cap (default: 30 smoke, 240 full)")
     p_train.add_argument("--max-cost-usd", type=float, default=None,
                          help="budget cap recorded in the manifest for supervisor policy")
+    p_train.add_argument("--detach", action="store_true",
+                         help="launch only and do not auto-supervise; use only when another supervisor is already running")
 
     p_dl = sub.add_parser("download", help="rsync results from a running/stopped pod")
     p_dl.add_argument("pod_id")
@@ -2203,7 +2233,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_watch.add_argument("--ssh-failure-limit", type=int, default=6,
                          help="consecutive SSH failures before stopping pod (default: 6)")
     p_watch.add_argument("--terminate-on-done", action="store_true",
-                         help="terminate after successful auto-download")
+                         default=True,
+                         help="terminate after successful auto-download (default)")
+    p_watch.add_argument("--keep-pod-on-done", dest="terminate_on_done", action="store_false",
+                         help="keep pod disk after successful auto-download")
 
     p_supervise = sub.add_parser("supervise", help="Supervise a manifest-backed training job")
     p_supervise.add_argument("--manifest", required=True, help="local run manifest JSON")
@@ -2211,7 +2244,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_supervise.add_argument("--interval", type=int, default=1, help="polling interval in minutes (default: 1)")
     p_supervise.add_argument("--ssh-failure-limit", type=int, default=6)
     p_supervise.add_argument("--terminate-on-done", action="store_true",
-                             help="terminate pod after artifacts are confirmed local")
+                             default=True,
+                             help="terminate pod after artifacts are confirmed local (default)")
+    p_supervise.add_argument("--keep-pod-on-done", dest="terminate_on_done", action="store_false",
+                             help="keep pod disk after artifacts are confirmed local")
 
     p_dlm = sub.add_parser("download-many", help="Download artifacts from multiple RUNNING pods concurrently")
     p_dlm.add_argument("pod_ids", nargs="+")
