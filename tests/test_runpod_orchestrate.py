@@ -218,3 +218,73 @@ def test_preflight_allows_only_manifest_recorded_resume_pods(monkeypatch):
 
     with pytest.raises(orchestrate.WorkflowError, match="stale RunPod pods"):
         orchestrate._assert_no_pods(args, execute=True, context="preflight", allowed_pod_ids={"other_pod"})
+
+
+def test_preflight_rejects_diverging_local_dest(tmp_path):
+    args = Namespace(
+        repo_ref="abcdef123456",
+        rational_kat_cu_ref="41a20b5",
+        volume_id=None,
+        local_dest=str(tmp_path / "elsewhere"),
+        allow_existing_pods=False,
+    )
+    phases = [orchestrate.PhaseSpec("smoke", "smoke", 20, 10, 30, False, False)]
+
+    with pytest.raises(orchestrate.WorkflowError, match="local-dest"):
+        orchestrate._preflight(args, phases, execute=True)
+
+
+def test_preflight_accepts_launcher_local_dest(monkeypatch):
+    # Default local-dest matches the launcher download root, so the dest guard
+    # passes and preflight proceeds to the credential check.
+    monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
+    args = Namespace(
+        repo_ref="abcdef123456",
+        rational_kat_cu_ref="41a20b5",
+        volume_id=None,
+        local_dest=str(orchestrate.DEFAULT_LOCAL_DEST),
+        allow_existing_pods=False,
+    )
+    phases = [orchestrate.PhaseSpec("smoke", "smoke", 20, 10, 30, False, False)]
+
+    with pytest.raises(orchestrate.WorkflowError, match="RUNPOD_API_KEY"):
+        orchestrate._preflight(args, phases, execute=True)
+
+
+def _ls_with_pod(pod_id: str) -> str:
+    return (
+        "Name                                ID                   GPU                    $/hr  Status\n"
+        "------------------------------------------------------------------------------------------\n"
+        f"nanochat-d12-grkan-g4               {pod_id}          NVIDIA H100 80GB HBM3   $3.29  RUNNING\n"
+    )
+
+
+def test_assert_no_pods_grace_waits_for_termination(monkeypatch):
+    # First poll still lists the just-terminated pod; the second poll is clear.
+    outputs = [_ls_with_pod("pod_dying"), "No pods.\n"]
+    sleeps = []
+
+    def fake_run(cmd, *, execute, capture=False):
+        return orchestrate.subprocess.CompletedProcess(cmd, 0, stdout=outputs.pop(0), stderr="")
+
+    monkeypatch.setattr(orchestrate, "_run", fake_run)
+    monkeypatch.setattr(orchestrate.time, "sleep", lambda *_a, **_k: sleeps.append(1))
+    args = Namespace(allow_existing_pods=False)
+
+    orchestrate._assert_no_pods(args, execute=True, context="post", settle_attempts=3, settle_seconds=0)
+
+    assert outputs == []  # exactly two polls consumed (a third would IndexError)
+    assert sleeps == [1]  # one grace wait between the two polls
+
+
+def test_assert_no_pods_grace_raises_when_pod_persists(monkeypatch):
+    monkeypatch.setattr(
+        orchestrate,
+        "_run",
+        lambda *_a, **_k: orchestrate.subprocess.CompletedProcess(["ls"], 0, stdout=_ls_with_pod("pod_stuck"), stderr=""),
+    )
+    monkeypatch.setattr(orchestrate.time, "sleep", lambda *_a, **_k: None)
+    args = Namespace(allow_existing_pods=False)
+
+    with pytest.raises(orchestrate.WorkflowError, match="stale RunPod pods"):
+        orchestrate._assert_no_pods(args, execute=True, context="post", settle_attempts=2, settle_seconds=0)

@@ -21,6 +21,7 @@ import math
 import os
 import subprocess
 import sys
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,6 +32,11 @@ try:
 except ImportError:  # pragma: no cover - direct script execution path
     from runpod_supervisor import first_guard_event, is_pinned_git_ref, make_job_id, utc_now_iso  # type: ignore
 
+try:
+    from scripts.runpod_launch import LOCAL_DEST as LAUNCHER_LOCAL_DEST
+except ImportError:  # pragma: no cover - direct script execution path
+    from runpod_launch import LOCAL_DEST as LAUNCHER_LOCAL_DEST  # type: ignore
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LAUNCHER = REPO_ROOT / "scripts" / "runpod_launch.py"
@@ -38,6 +44,8 @@ DEFAULT_LOCAL_DEST = REPO_ROOT / "checkpoints" / "nanochat"
 DEFAULT_WORKFLOW_DIR = DEFAULT_LOCAL_DEST / "orchestrator"
 TERMINAL_OK_STATES = {"terminated"}
 TERMINAL_BAD_STATES = {"failed", "stopping", "stopped"}
+POST_PHASE_SETTLE_ATTEMPTS = 4
+POST_PHASE_SETTLE_SECONDS = 15.0
 
 
 @dataclass(frozen=True)
@@ -244,6 +252,14 @@ def _preflight(
         raise WorkflowError("pilot/full phases require --volume-id")
 
     if execute:
+        configured_dest = Path(args.local_dest).resolve()
+        launcher_dest = (REPO_ROOT / LAUNCHER_LOCAL_DEST).resolve()
+        if configured_dest != launcher_dest:
+            raise WorkflowError(
+                f"--local-dest {args.local_dest!r} resolves to {configured_dest}, but the launcher "
+                f"downloads artifacts to {launcher_dest}; artifact verification would read an empty "
+                f"directory. Leave --local-dest at its default."
+            )
         if not os.environ.get("RUNPOD_API_KEY"):
             raise WorkflowError("RUNPOD_API_KEY must be exported before running the orchestrator")
         if not os.environ.get("GITHUB_TOKEN"):
@@ -278,18 +294,32 @@ def _assert_no_pods(
     execute: bool,
     context: str,
     allowed_pod_ids: set[str] | None = None,
+    settle_attempts: int = 1,
+    settle_seconds: float = POST_PHASE_SETTLE_SECONDS,
 ) -> None:
-    ls_result = _run(_launcher_cmd(["ls"]), execute=execute, capture=True)
-    if execute:
+    if not execute:
+        _run(_launcher_cmd(["ls"]), execute=False, capture=True)
+        return
+    allowed = allowed_pod_ids or set()
+    attempts = max(1, settle_attempts)
+    for attempt in range(1, attempts + 1):
+        ls_result = _run(_launcher_cmd(["ls"]), execute=True, capture=True)
         print(ls_result.stdout, end="")
         if ls_result.returncode != 0:
             raise WorkflowError("runpod ls failed")
         if "No pods." in ls_result.stdout:
             return
         live_pod_ids = _listed_pod_ids(ls_result.stdout)
-        allowed_pod_ids = allowed_pod_ids or set()
-        if live_pod_ids and live_pod_ids.issubset(allowed_pod_ids):
+        if live_pod_ids and live_pod_ids.issubset(allowed):
             return
+        if attempt < attempts:
+            print(
+                f"{context}: pods still listed after termination; waiting {settle_seconds:.0f}s "
+                f"for RunPod to settle (grace poll {attempt}/{attempts - 1})",
+                flush=True,
+            )
+            time.sleep(settle_seconds)
+            continue
         if not args.allow_existing_pods:
             raise WorkflowError(f"{context}: stale RunPod pods exist; terminate or pass --allow-existing-pods deliberately")
 
@@ -563,7 +593,13 @@ def _run_workflow(args: argparse.Namespace, *, execute: bool, manifest_path: Pat
 
             if execute:
                 _verify_artifacts(phase_run, model, phase)
-                _assert_no_pods(args, execute=True, context=f"post-{model.tag}-{phase.name}")
+                _assert_no_pods(
+                    args,
+                    execute=True,
+                    context=f"post-{model.tag}-{phase.name}",
+                    settle_attempts=POST_PHASE_SETTLE_ATTEMPTS,
+                    settle_seconds=POST_PHASE_SETTLE_SECONDS,
+                )
                 phase_run.state = "verified"
                 phase_run.completed_at = utc_now_iso()
             else:
