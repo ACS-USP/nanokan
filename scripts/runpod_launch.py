@@ -198,6 +198,10 @@ LOCAL_DEST = "checkpoints/nanochat"
 MANIFEST_DIR = "checkpoints/nanochat/runpod_manifests"
 DEFAULT_RATIONAL_KAT_CU_REF = "41a20b5"  # fixed Safe Padé kernel commit recorded in wiki/log.md
 DOWNLOAD_WINDOW_HOURS = 2
+# Bound the time from SSH access until the training log first appears.  The in-pod
+# watchdog only guards the *training* process, so a stall during pod setup (uv sync,
+# rational_kat_cu build, tokenizer build) would otherwise hang the supervisor forever.
+SETUP_DEADLINE_MINUTES = 25
 
 # Community machines known to have persistent networking issues.
 MACHINE_BLACKLIST: set[str] = {
@@ -1188,6 +1192,7 @@ def cmd_train(args):
     supervise_args.interval = 1
     supervise_args.ssh_failure_limit = 6
     supervise_args.terminate_on_done = True
+    supervise_args.setup_deadline_minutes = getattr(args, "setup_deadline_minutes", None)
     cmd_supervise(supervise_args)
 
 
@@ -1947,6 +1952,9 @@ def cmd_watch(args):
     ssh_opt = f"ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -p {ssh_port}"
     ssh_failures = 0
     log_line_offset = 1  # next unread line in the remote training log (1-indexed)
+    training_started = False
+    setup_deadline_minutes = getattr(args, "setup_deadline_minutes", None) or SETUP_DEADLINE_MINUTES
+    setup_deadline = time.monotonic() + setup_deadline_minutes * 60.0
 
     while True:
         r = subprocess.run(
@@ -1998,6 +2006,21 @@ def cmd_watch(args):
                     runpod.stop_pod(pod_id)
                     _save_manifest_state("stopped", event.reason)
                     sys.exit(1)
+
+        # Setup-phase deadline: a non-empty training log means the train script is
+        # running, i.e. clone/uv-sync/kernel-build/tokenizer all finished.  Until then
+        # nothing guards against a setup stall, so bound the wait and stop compute.
+        if not training_started and log_line_offset > 1:
+            training_started = True
+            print(f"[{time.strftime('%H:%M')}] Training started; setup-phase deadline cleared.")
+        if not training_started and time.monotonic() > setup_deadline:
+            reason = (
+                f"training did not start within {setup_deadline_minutes:.0f} min of SSH access — "
+                "pod setup stalled (uv sync / kernel build / tokenizer build)"
+            )
+            print(f"[{time.strftime('%H:%M')}] {reason} — stopping pod to cap spend.")
+            _stop_for_supervision_failure(reason)
+            sys.exit(1)
 
         status = r.stdout.strip().splitlines()[-1]
         if status == "failed":
@@ -2079,6 +2102,7 @@ def cmd_supervise(args):
     watch_args.ssh_failure_limit = args.ssh_failure_limit
     watch_args.terminate_on_done = args.terminate_on_done
     watch_args.manifest_path = args.manifest
+    watch_args.setup_deadline_minutes = getattr(args, "setup_deadline_minutes", None)
     cmd_watch(watch_args)
 
 
@@ -2210,6 +2234,8 @@ def build_parser() -> argparse.ArgumentParser:
                          help="budget cap recorded in the manifest for supervisor policy")
     p_train.add_argument("--detach", action="store_true",
                          help="launch only and do not auto-supervise; use only when another supervisor is already running")
+    p_train.add_argument("--setup-deadline-minutes", dest="setup_deadline_minutes", type=float, default=None,
+                         help=f"stop the pod if training has not started within N min of SSH access (default: {SETUP_DEADLINE_MINUTES})")
 
     p_dl = sub.add_parser("download", help="rsync results from a running/stopped pod")
     p_dl.add_argument("pod_id")
@@ -2237,6 +2263,8 @@ def build_parser() -> argparse.ArgumentParser:
                          help="terminate after successful auto-download (default)")
     p_watch.add_argument("--keep-pod-on-done", dest="terminate_on_done", action="store_false",
                          help="keep pod disk after successful auto-download")
+    p_watch.add_argument("--setup-deadline-minutes", dest="setup_deadline_minutes", type=float, default=None,
+                         help=f"stop the pod if training has not started within N min of SSH access (default: {SETUP_DEADLINE_MINUTES})")
 
     p_supervise = sub.add_parser("supervise", help="Supervise a manifest-backed training job")
     p_supervise.add_argument("--manifest", required=True, help="local run manifest JSON")
@@ -2248,6 +2276,8 @@ def build_parser() -> argparse.ArgumentParser:
                              help="terminate pod after artifacts are confirmed local (default)")
     p_supervise.add_argument("--keep-pod-on-done", dest="terminate_on_done", action="store_false",
                              help="keep pod disk after artifacts are confirmed local")
+    p_supervise.add_argument("--setup-deadline-minutes", dest="setup_deadline_minutes", type=float, default=None,
+                             help=f"stop the pod if training has not started within N min of SSH access (default: {SETUP_DEADLINE_MINUTES})")
 
     p_dlm = sub.add_parser("download-many", help="Download artifacts from multiple RUNNING pods concurrently")
     p_dlm.add_argument("pod_ids", nargs="+")

@@ -1,6 +1,8 @@
 import base64
+import itertools
 import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -236,3 +238,99 @@ def test_watchdog_writes_failure_bundle_on_nan(tmp_path):
     assert failed_sentinel.exists()
     payload = json.loads(failure_json.read_text())
     assert payload["reason"] == "loss_nan"
+
+
+class _FakeRunpod:
+    def __init__(self):
+        self.stopped = []
+        self.terminated = []
+
+    def get_pod(self, pod_id):
+        return {
+            "desiredStatus": "RUNNING",
+            "runtime": {"ports": [{"privatePort": 22, "ip": "1.2.3.4", "publicPort": 2222}]},
+        }
+
+    def stop_pod(self, pod_id):
+        self.stopped.append(pod_id)
+
+    def terminate_pod(self, pod_id):
+        self.terminated.append(pod_id)
+
+
+def _watch_args(**overrides):
+    class A:
+        pass
+
+    a = A()
+    a.pod_id = "pod_test"
+    a.dest = "/tmp/nanokan-watch-test"
+    a.interval = 1
+    a.volume_backed = False
+    a.ssh_failure_limit = 6
+    a.terminate_on_done = True
+    a.manifest_path = None
+    a.setup_deadline_minutes = 1
+    for k, v in overrides.items():
+        setattr(a, k, v)
+    return a
+
+
+def _install_watch_mocks(monkeypatch, fake_runpod, *, log_stdout, status_stdout):
+    monkeypatch.setattr(runpod_launch, "get_api_key", lambda: "rp_test")
+    monkeypatch.setattr(runpod_launch, "runpod", fake_runpod)
+
+    def fake_run(cmd, capture_output=False, text=False, **kwargs):
+        joined = " ".join(cmd)
+        if "echo ok" in joined:                        # sshd readiness probe
+            return subprocess.CompletedProcess(cmd, 0, stdout="ok\n", stderr="")
+        if "_train.log" in joined:                     # remote log streaming
+            return subprocess.CompletedProcess(cmd, 0, stdout=log_stdout, stderr="")
+        if "DONE_" in joined or "FAILED_" in joined:    # sentinel status check
+            return subprocess.CompletedProcess(cmd, 0, stdout=status_stdout, stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")  # rsync etc.
+
+    monkeypatch.setattr(runpod_launch.subprocess, "run", fake_run)
+    # First reading arms the deadline at t=0; the next reading is far past it.
+    clock = itertools.chain([0.0], itertools.repeat(1e9))
+    monkeypatch.setattr("time.monotonic", lambda: next(clock))
+    monkeypatch.setattr("time.sleep", lambda *a, **k: None)
+    monkeypatch.setattr(sys.stdout, "reconfigure", lambda **k: None, raising=False)
+
+
+def test_watch_stops_pod_when_setup_stalls(monkeypatch):
+    # No training-log output: the train script never started (e.g. uv sync stall).
+    fake = _FakeRunpod()
+    _install_watch_mocks(monkeypatch, fake, log_stdout="", status_stdout="running\n")
+
+    with pytest.raises(SystemExit):
+        runpod_launch.cmd_watch(_watch_args(pod_id="pod_stuck"))
+
+    assert fake.stopped == ["pod_stuck"]
+    assert fake.terminated == []
+
+
+def test_watch_does_not_stop_after_training_starts(monkeypatch):
+    # Training log has step output → training started; even with the clock past the
+    # deadline the setup guard must not fire.  The DONE sentinel ends the watch cleanly.
+    fake = _FakeRunpod()
+    monkeypatch.setattr(runpod_launch, "cmd_download", lambda _a: None)
+    _install_watch_mocks(
+        monkeypatch, fake,
+        log_stdout="step 00000/00020 | loss: 10.40\n",
+        status_stdout="done\n",
+    )
+
+    runpod_launch.cmd_watch(_watch_args(pod_id="pod_ok"))
+
+    assert fake.stopped == []
+
+
+def test_setup_deadline_flag_is_wired():
+    parser = runpod_launch.build_parser()
+    for argv in (["watch", "pod_1"], ["supervise", "--manifest", "m.json"], ["train", "--ffn-type", "grkan"]):
+        ns = parser.parse_args(argv)
+        assert hasattr(ns, "setup_deadline_minutes")
+        assert ns.setup_deadline_minutes is None  # default → cmd_watch falls back to SETUP_DEADLINE_MINUTES
+    override = parser.parse_args(["watch", "pod_1", "--setup-deadline-minutes", "10"])
+    assert override.setup_deadline_minutes == 10.0
