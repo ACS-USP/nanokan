@@ -1399,6 +1399,12 @@ def _make_eval_startup(nanochat_base: str, upload_tokenizer: bool = False) -> li
             "; fi"
         )
         cmds.append(tok_block)
+    # Download 2 ClimbMix shards (val + one train) for BPB eval.  Even when the
+    # tokenizer is uploaded, the eval pod needs the data to compute BPB.  2 shards
+    # (~130 MB) download in <30 s on the pod's fast network.
+    cmds.append(
+        f".venv/bin/python -m nanochat.dataset -n 1 -w 1"
+    )
     cmds += [
         f"touch {nanochat_base}/READY_FOR_EVAL",
         "echo Environment ready. Waiting for checkpoint rsync and eval trigger.",
